@@ -1,0 +1,11 @@
+# Switch LLM or memory backend by changing `provider` — no code edits required.
+llm:
+  provider: ollama
+  ollama:
+    base_url: "${OLLAMA_BASE_URL}"
+    model: "${OLLAMA_MODEL}"
+
+memory:
+  provider: file
+  file:
+    base_path: "${HENRY_MEMORY_PATH}"
