@@ -23,6 +23,17 @@ from core.llm.openai import OpenAILLMProvider
 
 logger = logging.getLogger(__name__)
 
+_MEMORY_INTENT_SYSTEM = (
+    "You classify whether a single user message contains information Henry should remember "
+    "long-term about this user: stable preferences, standing instructions, recurring lists, "
+    "their own name or role, names of people/pets they identify as theirs, or facts they "
+    "clearly state as true about themselves. Casual chat, one-off questions, or hypotheticals "
+    "with no durable fact should not be remembered.\n"
+    "Reply with one JSON object only, no markdown or code fences. Schema:\n"
+    '{"remember": <boolean>, "facts": [{"category": "<short label>", "fact": "<one concise sentence>"}]}\n'
+    "If remember is false, facts must be []. Each fact must be self-contained and safe to store."
+)
+
 try:
     from presidio_analyzer import AnalyzerEngine
     from presidio_anonymizer import AnonymizerEngine
@@ -728,6 +739,7 @@ class RoutedLLMProvider:
         privacy_cfg: PrivacyFromPresidioConfig,
         supervisor_cfg: SupervisorConfig,
         supervisor_base_url: str,
+        memory_manager: Any | None = None,
     ) -> None:
         self._root = root
         self._candidates = list(candidates)
@@ -739,6 +751,7 @@ class RoutedLLMProvider:
         self._privacy_cfg = privacy_cfg
         self._supervisor_cfg = supervisor_cfg
         self._supervisor_base_url = supervisor_base_url.rstrip("/")
+        self._memory_manager = memory_manager
         self._provider_cache: dict[str, LLMProvider] = {}
         self._cap_overrides: dict[str, float] = {}
         self._last_refresh_monotonic = 0.0
@@ -748,7 +761,12 @@ class RoutedLLMProvider:
             self._cap_overrides = load_cached_capabilities(self._intel)
 
     @classmethod
-    def from_project_root(cls, root: Path | None = None) -> RoutedLLMProvider:
+    def from_project_root(
+        cls,
+        root: Path | None = None,
+        *,
+        memory_manager: Any | None = None,
+    ) -> RoutedLLMProvider:
         root = root or Path(__file__).resolve().parents[1]
         henry, providers = load_routing_config(root)
         routing = henry.get("routing") or {}
@@ -777,6 +795,7 @@ class RoutedLLMProvider:
             privacy_cfg=privacy_cfg,
             supervisor_cfg=supervisor_cfg,
             supervisor_base_url=supervisor_base_url,
+            memory_manager=memory_manager,
         )
 
     def _maybe_refresh_benchmarks_locked(self) -> None:
@@ -924,6 +943,83 @@ class RoutedLLMProvider:
             self._maybe_refresh_benchmarks_locked()
             _, details = self._compute_routing(user_blob)
         return details
+
+    def process_memory_intent(self, user_text: str) -> dict[str, Any]:
+        """
+        Ask a local Ollama model whether the user message contains durable personal facts;
+        if so, persist rows into SQLite via the dual-memory manager.
+        """
+        result: dict[str, Any] = {"saved": 0, "facts": []}
+        mm = self._memory_manager
+        if mm is None:
+            result["skipped"] = "no_memory_manager"
+            return result
+        if not getattr(mm, "is_encrypted_storage_available", False):
+            result["skipped"] = "mount_unavailable"
+            return result
+        if not getattr(mm, "personal_memory_ready", False):
+            result["skipped"] = "personal_db_unavailable"
+            return result
+
+        stripped = user_text.strip()
+        if len(stripped) < 8:
+            return result
+
+        local_provider: LLMProvider | None = None
+        with self._lock:
+            for cand in self._candidates:
+                if cand.deployment == "local" and cand.provider == "ollama" and provider_is_usable(cand):
+                    local_provider = self._get_provider(cand)
+                    break
+
+        if local_provider is None:
+            result["skipped"] = "no_local_ollama"
+            return result
+
+        messages = [
+            ChatMessage(role="system", content=_MEMORY_INTENT_SYSTEM),
+            ChatMessage(
+                role="user",
+                content=json.dumps({"user_message": stripped}, ensure_ascii=False),
+            ),
+        ]
+        try:
+            raw = local_provider.complete(messages)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("process_memory_intent LLM call failed: %s", exc)
+            result["error"] = str(exc)
+            return result
+
+        obj = _extract_json_object(raw)
+        if not isinstance(obj, Mapping):
+            result["skipped"] = "unparseable_json"
+            return result
+
+        remember = bool(obj.get("remember"))
+        if not remember:
+            result["skipped"] = "no_durable_facts"
+            return result
+
+        facts_raw = obj.get("facts")
+        if not isinstance(facts_raw, list) or not facts_raw:
+            result["skipped"] = "empty_facts"
+            return result
+
+        saved_ids: list[int] = []
+        for row in facts_raw:
+            if not isinstance(row, Mapping):
+                continue
+            cat = str(row.get("category") or "general").strip()
+            fact = str(row.get("fact") or "").strip()
+            if not fact:
+                continue
+            row_id = mm.save_user_fact(cat, fact)
+            if row_id is not None:
+                saved_ids.append(row_id)
+
+        result["saved"] = len(saved_ids)
+        result["fact_ids"] = saved_ids
+        return result
 
     def _get_provider(self, c: ModelCandidate) -> LLMProvider:
         key = f"{c.provider}:{c.model}"
