@@ -22,10 +22,23 @@ class OllamaLLMProvider:
             "stream": False,
         }
         url = f"{self._base_url}/api/chat"
-        with httpx.Client(timeout=self._timeout) as client:
-            response = client.post(url, json=payload)
-            response.raise_for_status()
-            data = response.json()
+        try:
+            with httpx.Client(timeout=self._timeout) as client:
+                response = client.post(url, json=payload)
+                response.raise_for_status()
+                data = response.json()
+        except httpx.ConnectError:
+            raise RuntimeError(
+                f"Ollama not reachable at {self._base_url}. "
+                "Is it running? Start with: ollama serve"
+            )
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                raise RuntimeError(
+                    f"Model '{self._model}' not found. "
+                    f"Pull it with: ollama pull {self._model}"
+                )
+            raise RuntimeError(f"Ollama returned HTTP {exc.response.status_code}")
         message = data.get("message") or {}
         content = message.get("content")
         if not isinstance(content, str):

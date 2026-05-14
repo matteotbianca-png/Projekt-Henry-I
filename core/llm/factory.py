@@ -45,7 +45,7 @@ def build_llm_provider(config_path: Path | None = None) -> LLMProvider:
         base_url = _expand_placeholders(str(oc.get("base_url") or "")).strip()
         model = _expand_placeholders(str(oc.get("model") or "")).strip()
         if not base_url:
-            base_url = os.environ.get("OLLAMA_BASE_URL", "http://host.docker.internal:11434")
+            base_url = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
         if not model:
             model = os.environ.get("OLLAMA_MODEL", "llama3.2")
         return OllamaLLMProvider(base_url=base_url, model=model)

@@ -688,7 +688,7 @@ def _ollama_base_url(providers: Mapping[str, Any]) -> str:
     oc = llm.get("ollama") or {}
     base = _expand_placeholders(str(oc.get("base_url") or "")).strip()
     if not base:
-        base = os.environ.get("OLLAMA_BASE_URL", "http://host.docker.internal:11434")
+        base = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
     return base.rstrip("/")
 
 

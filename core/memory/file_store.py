@@ -5,8 +5,6 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from core.memory.base import MemoryStore
-
 _SAFE_KEY = re.compile(r"[^a-zA-Z0-9._-]+")
 
 

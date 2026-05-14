@@ -1,5 +1,7 @@
-# Henry's Secret Vault (Do not upload!)
+# Secrets — NEVER commit these
 .env
+.env.*
+!.env.example
 auth/
 credentials/
 *.tokens
@@ -9,6 +11,10 @@ credentials/
 venv/
 __pycache__/
 *.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
 .ipynb_checkpoints/
 
 # Project Data & Logs
@@ -17,6 +23,18 @@ logs/
 *.log
 *.db
 
+# Chroma / vector store artifacts
+chroma_data/
+
 # OS Specific
 .DS_Store
 Thumbs.db
+._*
+
+# IDE
+.idea/
+*.swp
+*.swo
+
+# Cursor
+.cursor/
