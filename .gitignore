@@ -1,0 +1,22 @@
+# Henry's Secret Vault (Do not upload!)
+.env
+auth/
+credentials/
+*.tokens
+
+# Python & Environment
+.venv/
+venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Project Data & Logs
+data/
+logs/
+*.log
+*.db
+
+# OS Specific
+.DS_Store
+Thumbs.db

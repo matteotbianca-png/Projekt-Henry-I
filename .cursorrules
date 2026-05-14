@@ -1,0 +1,19 @@
+# HENRY PROJECT - CORE DEVELOPMENT RULES
+
+## 1. ARCHITECTURE & MODULARITY
+- **Provider Agnostic:** The LLM (Ollama) and Memory systems must be abstracted. Changing the provider (e.g., swapping Ollama for another API) must only require a config change.
+- **Modular Only:** Every feature is a standalone module in `tools/` or `services/`.
+- **Clean Code:** PEP 8, small functions, clear headers.
+
+## 2. SECURITY & SANDBOX
+- **Docker-Ready:** Assume containerized execution only. Use ENV variables.
+- **Manual Encryption:** Data in `/mnt/secure_memory` is only available after manual mount/decryption.
+- **Isolation:** No host-system access without explicit routing.
+
+## 3. PROMPT & LOGIC
+- **Global Rules:** Respect `config/global_rules.yaml` (short, concise, honest).
+- **Trigger Modes:** Key-word based overrides for "Deep Research" or "Code-Review".
+
+## 4. GITHUB WORKFLOW
+- **Explain your Work:** Every PR must contain a "What, Why & Security Impact" summary.
+- **Review Loop:** Use separate branches; never push directly to main.

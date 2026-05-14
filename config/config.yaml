@@ -1,0 +1,84 @@
+# Henry dynamic LLM routing — weights and candidates (see core/llm_manager.py).
+# When routing.enabled is false, config/providers.yaml single-provider mode is used.
+
+routing:
+  enabled: true
+  weights:
+    w1_capability: 1.0
+    w2_privacy: 2.0
+    w3_cost: 0.9
+    w4_latency: 0.002
+  # Scales w2 from baseline to baseline * multiplier as Presidio severity approaches 1.0.
+  pii_privacy_weight_multiplier: 3.5
+  # Maps Presidio entity hits into Privacy_Impact per candidate (see core/llm_manager.py).
+  privacy_from_presidio:
+    local_severity_boost: 0.35
+    cloud_severity_discount: 0.6
+    cloud_anonymization_trust: 0.78
+    severity_cap: 12.0
+    entity_weights: {}
+  supervisor:
+    enabled: true
+    provider: ollama
+    model: "qwen2.5:7b"
+    timeout_seconds: 120.0
+    # Final score = (1 - blend_weight) * formula_total + blend_weight * supervisor_total (per candidate).
+    blend_weight: 0.65
+  presidio:
+    enabled: true
+    language: en
+  anonymization:
+    # When the chosen route is cloud, user-visible content is anonymized first.
+    enabled: true
+  autonomous_intelligence:
+    enabled: true
+    refresh_interval_seconds: 86400
+    cache_path: data/capability_benchmarks.json
+    request_timeout_seconds: 45.0
+    sources:
+      - url: "https://api.wulong.dev/arena-ai-leaderboards/v1/leaderboard?name=text"
+        format: wulong_arena_v1
+
+# Each entry lists baseline privacy_impact (YAML anchor); effective Privacy_Impact is derived from Presidio.
+# Total score blends formula (weights below) with supervisor (Qwen on Ollama) per routing.supervisor.blend_weight.
+candidates:
+  - id: ollama-local
+    provider: ollama
+    deployment: local
+    model: "${OLLAMA_MODEL}"
+    capability: 0.62
+    privacy_impact: 1.0
+    cost: 0.0
+    latency_ms: 150
+    benchmark_aliases:
+      - llama
+      - llama-3.2
+      - llama-3.3
+      - llama3.2
+      - llama3.3
+      - qwen
+      - mistral
+
+  - id: openai-gpt4o
+    provider: openai
+    deployment: cloud
+    model: "gpt-4o"
+    capability: 0.92
+    privacy_impact: 0.18
+    cost: 0.85
+    latency_ms: 800
+    benchmark_aliases:
+      - gpt-4o
+      - chatgpt-4o
+
+  - id: anthropic-claude35
+    provider: anthropic
+    deployment: cloud
+    model: "claude-3-5-sonnet-20241022"
+    capability: 0.9
+    privacy_impact: 0.2
+    cost: 0.88
+    latency_ms: 900
+    benchmark_aliases:
+      - claude-3-5-sonnet
+      - claude-3.5-sonnet
