@@ -17,8 +17,8 @@ def _expand_placeholders(value: str) -> str:
 
 
 def _load_yaml(path: Path) -> Mapping[str, Any]:
-    with path.open("r", encoding="utf-8") as handle:
-        data = yaml.safe_load(handle) or {}
+    raw = path.read_text(encoding="utf-8")
+    data = yaml.safe_load(os.path.expandvars(raw)) or {}
     if not isinstance(data, Mapping):
         raise ValueError("providers.yaml must be a mapping at the root")
     return data

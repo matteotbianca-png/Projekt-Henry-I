@@ -17,15 +17,24 @@ def _expand_placeholders(value: str) -> str:
 
 
 def _load_yaml(path: Path) -> Mapping[str, Any]:
-    with path.open("r", encoding="utf-8") as handle:
-        data = yaml.safe_load(handle) or {}
+    raw = path.read_text(encoding="utf-8")
+    data = yaml.safe_load(os.path.expandvars(raw)) or {}
     if not isinstance(data, Mapping):
-        raise ValueError("providers.yaml must be a mapping at the root")
+        raise ValueError(f"{path.name} must be a mapping at the root")
     return data
 
 
 def build_llm_provider(config_path: Path | None = None) -> LLMProvider:
     root = Path(__file__).resolve().parents[2]
+    henry_path = root / "config" / "config.yaml"
+    if henry_path.is_file():
+        henry = _load_yaml(henry_path)
+        routing = henry.get("routing") or {}
+        if isinstance(routing, Mapping) and routing.get("enabled"):
+            from core.llm_manager import build_routed_llm
+
+            return build_routed_llm(root)
+
     cfg_file = config_path or (root / "config" / "providers.yaml")
     cfg = _load_yaml(cfg_file)
     llm_cfg = cfg.get("llm") or {}

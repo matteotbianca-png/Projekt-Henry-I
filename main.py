@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 import yaml
+from dotenv import load_dotenv
 
 from core.llm.base import ChatMessage
 from core.llm.factory import build_llm_provider
@@ -16,8 +17,8 @@ from core.memory.factory import build_memory_store
 def _load_global_rules(path: Path) -> str:
     if not path.is_file():
         return ""
-    with path.open("r", encoding="utf-8") as handle:
-        data = yaml.safe_load(handle) or {}
+    raw = path.read_text(encoding="utf-8")
+    data = yaml.safe_load(os.path.expandvars(raw)) or {}
     rules = data.get("rules") if isinstance(data, dict) else None
     if not isinstance(rules, list):
         return ""
@@ -69,4 +70,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    load_dotenv()
     raise SystemExit(main())
