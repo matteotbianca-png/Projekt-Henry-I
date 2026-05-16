@@ -1,19 +1,28 @@
-# HENRY PROJECT - CORE DEVELOPMENT RULES
+HENRY PROJECT - CORE DEVELOPMENT RULES
+1. ARCHITECTURE, MODULARITY & MICROSERVICES
+Headless Core & UI Satellites: Henry is transitioning from a monolith to a decoupled microservice architecture. main.py is becoming the central API Core Router running FastAPI (http://localhost:8000). All frontends (Telegram Bot, Browser Extensions, CLI) and background workers are standalone programs that communicate exclusively via HTTP REST-API.
 
-## 1. ARCHITECTURE & MODULARITY
-- **Provider Agnostic:** The LLM (Ollama) and Memory systems must be abstracted. Changing the provider (e.g., swapping Ollama for another API) must only require a config change.
-- **Modular Only:** Every feature is a standalone module in `tools/` or `services/`.
-- **Clean Code:** PEP 8, small functions, clear headers.
+Provider Agnostic: The LLM (Ollama, OpenAI, Anthropic) and Memory systems must be abstracted via protocols. Swapping or routing between providers must only require a config change in providers.yaml.
 
-## 2. SECURITY & SANDBOX
-- **Docker-Ready:** Assume containerized execution only. Use ENV variables.
-- **Manual Encryption:** Data in `/mnt/secure_memory` is only available after manual mount/decryption.
-- **Isolation:** No host-system access without explicit routing.
+Strict Separation of Concerns: Background Workers (like the OCR Watcher in tools/file_manager.py) must handle only their specialized task. They MUST NOT contain Telegram-bot logic or direct database connections. They execute their task and send JSON payloads to the Core API (/v1/process).
 
-## 3. PROMPT & LOGIC
-- **Global Rules:** Respect `config/global_rules.yaml` (short, concise, honest).
-- **Trigger Modes:** Key-word based overrides for "Deep Research" or "Code-Review".
+No Legacy Leftovers: When extracting features into standalone programs, completely strip out old internal callbacks and unneeded manager imports. Provide a clean if __name__ == "__main__": block for independent terminal testing.
 
-## 4. GITHUB WORKFLOW
-- **Explain your Work:** Every PR must contain a "What, Why & Security Impact" summary.
-- **Review Loop:** Use separate branches; never push directly to main.
+Clean Code: PEP 8, typing hints (from __future__ import annotations), small functions, and clear headers.
+
+2. SECURITY, STORAGE & PRIVACY
+Encrypted Volume Shield: The Core must strictly check if the encrypted volume under MEMORY_MOUNT_PATH (e.g., /Volumes/HenryData/) is active. If offline, the system must set SECURITY_FLIGHT_MODE = True, block all database writes (ChromaDB/SQLite), and run in a volatile safe mode to prevent PII leaks to the local SSD.
+
+Anonymization Schleuse: A local Presidio PII shield must inspect and mask sensitive data before the multi-model router evaluates cloud-based routing scores. Unencrypted cleartext must never leave the local environment.
+
+OrbStack / Docker Ready: All standalone services must be fully containerizable via OrbStack, utilizing environment variables (.env) and network isolation.
+
+3. PROMPT & ROUTING LOGIC
+Global Rules: Respect config/global_rules.yaml (short, concise, honest).
+
+Multi-Model Scoring: The core routing engine dynamically routes queries based on a weighted matrix analyzing capability, privacy, cost, and latency.
+
+4. GITHUB WORKFLOW
+Explain your Work: Every PR must contain a "What, Why & Security Impact" summary.
+
+Review Loop: Use separate branches; never push directly to main. Incremental, step-by-step refactoring only.

@@ -944,6 +944,10 @@ class RoutedLLMProvider:
             _, details = self._compute_routing(user_blob)
         return details
 
+    def route_query(self, raw_text: str) -> dict[str, Any]:
+        """Presidio-backed multi-model routing analysis for a text blob (documents or chat)."""
+        return self.preview_routing(raw_text)
+
     def process_memory_intent(self, user_text: str) -> dict[str, Any]:
         """
         Ask a local Ollama model whether the user message contains durable personal facts;

@@ -1,18 +1,31 @@
-"""File pipeline manager — watches inbox, OCR-extracts text, and archives into 7 category folders."""
+"""Autonomous document worker — inbox watcher, OCR, and physical archiving.
+
+Standalone service: POST OCR text to the Henry Core API; receive archive commands
+via a local inbound API. No Telegram, LLM routing, or direct database access.
+"""
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
 import re
 import shutil
+import sys
+import threading
 import time
+import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+
+from core.env import load_project_env
+from core.port_guard import reclaim_tcp_listen_port
+
+load_project_env()
 
 import httpx
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
 import pytesseract
 from pdf2image import convert_from_path
 from PIL import Image
@@ -36,7 +49,14 @@ if not Path(_TESSERACT_CMD).is_file():
         flush=True,
     )
 
-_DEFAULT_ROOT = os.environ.get("HENRY_FILES_ROOT", "")
+_DEFAULT_ROOT = os.environ.get(
+    "HENRY_FILES_ROOT",
+    str(Path.home() / "Desktop" / "Henry Files"),
+).strip()
+
+_CORE_API_URL = os.environ.get("HENRY_CORE_API_URL", "http://127.0.0.1:8000").rstrip("/")
+_WORKER_API_HOST = os.environ.get("HENRY_WORKER_API_HOST", "127.0.0.1")
+_WORKER_API_PORT = int(os.environ.get("HENRY_WORKER_API_PORT", "8001"))
 
 INBOX_FOLDER = "01_Eingang_OCR"
 
@@ -260,11 +280,15 @@ _CLASSIFY_SYSTEM_PROMPT = (
     '  "Korrespondenz"  — general letters, contracts, confirmations, Quittung\n\n'
     "STEP 2 — DOCUMENT TYPE: A short label for the specific document "
     '(e.g. "Mietvertrag", "Rechnung", "Lohnabrechnung", "Kontoauszug").\n\n'
-    "STEP 3 — PROVIDER: The company or person who sent/issued this document. "
+    "STEP 3 — SMART GROUPING (optional): Populate key \"grouping_special\" ONLY when "
+    "a recurring document type would clearly benefit from a dedicated folder "
+    '(e.g. "Insurance Policies", "Steuerunterlagen"). Use empty string \"\" when '
+    'the default date ladder [Year]/[Month]/[Day] under the Domain is appropriate.\n\n'
+    "STEP 4 — PROVIDER / COUNTERPARTY: The company or person who sent/issued this document. "
     "Look in the header, letterhead, sender address, or signature block. "
     "If you see Swiss company names or specific addresses, use them. "
     'If you truly cannot identify the provider, use an empty string "".\n\n'
-    "STEP 4 — DATE: The document date in YYYY-MM-DD format. "
+    "STEP 5 — DATE: The document date in YYYY-MM-DD format. "
     "Swiss DD.MM.YYYY must be converted. Use the document date, not due dates.\n\n"
     "Return ONLY a valid JSON object — no markdown, no code fences, no extra text.\n"
     "The JSON must have exactly these keys:\n"
@@ -274,10 +298,17 @@ _CLASSIFY_SYSTEM_PROMPT = (
     '  "date": YYYY-MM-DD or "Unknown"\n'
     '  "year": YYYY or "Unknown"\n'
     '  "month": MM or "Unknown"\n'
+    '  "grouping_special": recurring-folder suggestion or "" — never invent new Domains '
+    '("01_Wohnen" … "07_Korrespondenz");\n'
     '  "summary": one-sentence summary\n\n'
-    "IMPORTANT: Even if you cannot identify the provider, you MUST still assign "
-    "a category and document_type. Never fail the entire classification just "
-    "because the provider is unclear."
+    "IMPORTANT:\n"
+    "- Even if you cannot identify the provider, you MUST still assign "
+    "a category and document_type.\n"
+    '- For formal contracts ("Vertrag", "Contract"), classify correctly (e.g. '
+    "\"Mietvertrag\"→Wohnen, \"Arbeitsvertrag\"→Arbeit) — Henry will archive under "
+    "Contracts/<Entity> automatically.\n"
+    "- NEVER assign a synthetic 08_* domain folder; if nothing fits reasonably, "
+    "pick the closest of the seven and mention the uncertainty in summary."
 )
 
 _FALLBACK_META: dict[str, str] = {
@@ -288,9 +319,48 @@ _FALLBACK_META: dict[str, str] = {
     "year": "Unknown",
     "month": "Unknown",
     "summary": "Unknown",
+    "grouping_special": "",
 }
 
 _META_KEYS = tuple(_FALLBACK_META.keys())
+
+# Smart grouping overrides (prior to default date ladder). Lohn beats generic "Vertrag"-like types.
+_CONTRACT_DOCUMENT_MARKERS = (
+    "vertrag",
+    "contract",
+    "mietvertrag",
+    "arbeitsvertrag",
+    "kaufvertrag",
+    "leasingvertrag",
+    "nebeneintragung",
+    "nebeneinbarung",
+    "unterzeichneter vertrag",
+)
+
+
+def _is_lohnabrechnung(meta: dict[str, str]) -> bool:
+    """Payslips use 04_Arbeit/Lohnabrechnungen/[Year]/[Month] (no day layer)."""
+    dt = meta.get("document_type", "").lower()
+    if any(x in dt for x in ("lohnabrechnung", "gehaltsabrechnung", "salary slip", "payroll")):
+        return True
+    return "lohn" in dt and "abrechnung" in dt
+
+
+def _is_contract_document(meta: dict[str, str]) -> bool:
+    """Contracts use [Domain]/Contracts/[Entity] — no date path."""
+    if _is_lohnabrechnung(meta):
+        return False
+    dt = meta.get("document_type", "").lower()
+    return any(marker in dt for marker in _CONTRACT_DOCUMENT_MARKERS)
+
+
+def _is_under_tree(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+    except ValueError:
+        return False
+    else:
+        return True
 
 
 def _extract_json_object(text: str) -> dict[str, Any] | None:
@@ -358,8 +428,12 @@ def _call_ollama_classify(
 
     result: dict[str, str] = {}
     for key in _META_KEYS:
-        val = str(obj.get(key, "Unknown")).strip()
-        result[key] = val if val else "Unknown"
+        fallback = "" if key == "grouping_special" else "Unknown"
+        val = str(obj.get(key, fallback)).strip()
+        if key == "grouping_special":
+            result[key] = "" if val in ("Unknown", "") else val
+        else:
+            result[key] = val if val else "Unknown"
     return result
 
 
@@ -418,7 +492,49 @@ def classify_document(
     elif provider == "Unknown":
         result["provider"] = ""
 
+    gs = result.get("grouping_special", "")
+    if gs in ("Unknown", "", None):
+        result["grouping_special"] = ""
+    elif _is_contract_document(result):
+        # Contracts use Contracts/<Entity>; date grouping is suppressed.
+        result["grouping_special"] = ""
+
     return result
+
+
+# --- Worker API models (inbound from Core) -----------------------------------
+
+
+class ArchiveExecuteCommand(BaseModel):
+    """Payload from Core after user approval — triggers physical file move."""
+
+    pending_id: str
+    action: Literal["confirm", "edit"]
+    metadata_override: dict[str, str] | None = None
+    classification: dict[str, str] | None = Field(
+        default=None,
+        description="Final metadata from Core (category, document_type, provider, date, year, month)",
+    )
+
+
+class _PendingRecord:
+    """Operational memory entry for a file awaiting archive approval."""
+
+    __slots__ = ("pending_id", "staged_path", "inbox_path", "filename", "raw_text")
+
+    def __init__(
+        self,
+        pending_id: str,
+        staged_path: Path,
+        inbox_path: Path,
+        filename: str,
+        raw_text: str,
+    ) -> None:
+        self.pending_id = pending_id
+        self.staged_path = staged_path
+        self.inbox_path = inbox_path
+        self.filename = filename
+        self.raw_text = raw_text
 
 
 class _InboxHandler(FileSystemEventHandler):
@@ -476,25 +592,15 @@ class _ManualReviewHandler(FileSystemEventHandler):
 
 class HenryFileManager:
     """
-    Manages Henry's category-based document pipeline.
+    Autonomous document worker: Watchdog + OCR + operational memory + physical archive.
 
-    Visible folders (created automatically under *root*):
-        01_Eingang_OCR   — incoming documents (watched)
-        Archiv/          — long-term archive, contains category subfolders:
-            01_Wohnen, 02_Finanzen, 03_Versicherung, 04_Arbeit,
-            05_Gesundheit, 06_Mobilität, 07_Korrespondenz
-
-    System folder (not for the user):
-        internal/        — temp files, debug output, document memory
+    Visible folders under *root* (default ``~/Desktop/Henry Files``):
+        01_Eingang_OCR/  — watched inbox
+        Archiv/          — category archive tree
+        internal/        — transient temp + pending staging only
     """
 
-    def __init__(
-        self,
-        root: Path | str | None = None,
-        *,
-        on_file_processed: Any | None = None,
-        memory_manager: Any | None = None,
-    ) -> None:
+    def __init__(self, root: Path | str | None = None) -> None:
         self._root = Path(root or _DEFAULT_ROOT or ".").resolve()
 
         self.inbox = self._root / INBOX_FOLDER
@@ -506,30 +612,25 @@ class HenryFileManager:
             self._categories[cat] = self._archive / folder
 
         self._internal = self._root / "internal"
-        self._processing = self._internal / "processing"
-        self._temp_backup = self._internal / "temp_backup"
+        self._temp = self._internal / "temp"
         self._pending = self._internal / "pending"
-        self._texts_dir = self._internal / "extracted_texts"
-        self._debug_texts = self._internal / "debug_texte"
-        self._doc_memory = self._internal / "document_memory"
-        self._knowledge_base_path = self._root / "knowledge_base.json"
 
         self._ensure_dirs()
 
         self._observer: Observer | None = None
-        self._extracted: dict[str, str] = {}
-        self._on_file_processed = on_file_processed
-        self._memory_manager = memory_manager
-        self._event_loop: Any | None = None
-
-        self._pending_items: dict[str, dict[str, Any]] = {}
+        self._pending_lock = threading.Lock()
+        self._pending_files: dict[str, str] = {}
+        self._pending_records: dict[str, _PendingRecord] = {}
 
     def _ensure_dirs(self) -> None:
         dirs = [
-            self.inbox, self._manual_review,
-            self._archive, *self._categories.values(),
-            self._internal, self._processing, self._temp_backup, self._pending,
-            self._texts_dir, self._debug_texts, self._doc_memory,
+            self.inbox,
+            self._manual_review,
+            self._archive,
+            *self._categories.values(),
+            self._internal,
+            self._temp,
+            self._pending,
         ]
         for d in dirs:
             d.mkdir(parents=True, exist_ok=True)
@@ -540,6 +641,8 @@ class HenryFileManager:
         """Begin monitoring inbox and manual_review (non-blocking)."""
         if self._observer is not None:
             return
+
+        os.makedirs(self._temp, exist_ok=True)
 
         inbox_abs = str(self.inbox.resolve())
         print(f"Henry is now watching: {inbox_abs}", flush=True)
@@ -570,45 +673,29 @@ class HenryFileManager:
         self._observer.join()
         self._observer = None
 
-    def set_event_loop(self, loop: Any) -> None:
-        """Store the running asyncio event loop so watchdog threads can schedule coroutines."""
-        self._event_loop = loop
-
     def _auto_process_pending(self) -> None:
-        """Called from the watchdog thread after a file is copied to temp_backup."""
-        results = self.process_inbox()
-        cb = self._on_file_processed
-        if not cb or not results:
-            return
-        loop = self._event_loop
-        for entry in results:
-            if loop is not None and loop.is_running():
-                loop.call_soon_threadsafe(asyncio.ensure_future, cb(entry))
-            else:
-                try:
-                    cb(entry)
-                except Exception:  # noqa: BLE001
-                    pass
+        """Called from the watchdog thread after a file is copied to internal/temp."""
+        self.process_inbox()
 
     # --- Processing stage --------------------------------------------------
 
     def _stage_to_backup(self, src: Path) -> Path | None:
-        """Copy a newly detected file into temp_backup for safe processing.
+        """Copy a newly detected file into internal/temp for safe processing.
 
         The original stays in the inbox until processing succeeds.
         """
         if not src.is_file():
             return None
-        dest = self._temp_backup / src.name
+        dest = self._temp / src.name
         if dest.exists():
             stem, suffix = dest.stem, dest.suffix
-            dest = self._temp_backup / f"{stem}_{int(time.time())}{suffix}"
+            dest = self._temp / f"{stem}_{int(time.time())}{suffix}"
         try:
             shutil.copy2(str(src), str(dest))
-            logger.info("Backed up to temp_backup: %s", dest.name)
+            logger.info("Staged to temp: %s", dest.name)
             return dest
         except OSError as exc:
-            logger.warning("Could not copy %s to temp_backup: %s", src.name, exc)
+            logger.warning("Could not copy %s to temp: %s", src.name, exc)
             return None
 
     def _move_to_manual_review(self, src: Path) -> Path | None:
@@ -625,99 +712,74 @@ class HenryFileManager:
             logger.warning("Could not move %s to manual_review: %s", src.name, exc)
             return None
 
-    # --- Knowledge base ---------------------------------------------------
+    def _register_pending(self, record: _PendingRecord) -> None:
+        with self._pending_lock:
+            self._pending_files[record.pending_id] = str(record.staged_path)
+            self._pending_records[record.pending_id] = record
 
-    def _load_knowledge_base(self) -> list[dict[str, Any]]:
-        if not self._knowledge_base_path.is_file():
-            return []
-        try:
-            data = json.loads(self._knowledge_base_path.read_text(encoding="utf-8"))
-            return data if isinstance(data, list) else []
-        except (json.JSONDecodeError, OSError):
-            return []
+    def _get_pending(self, pending_id: str) -> _PendingRecord | None:
+        with self._pending_lock:
+            return self._pending_records.get(pending_id)
 
-    def _save_knowledge_base(self, entries: list[dict[str, Any]]) -> None:
+    def _pop_pending(self, pending_id: str) -> _PendingRecord | None:
+        with self._pending_lock:
+            self._pending_files.pop(pending_id, None)
+            return self._pending_records.pop(pending_id, None)
+
+    def _post_to_core(self, pending_id: str, filename: str, raw_text: str) -> dict[str, Any] | None:
+        """Send OCR text to the Core API for classification."""
+        url = f"{_CORE_API_URL}/v1/process"
+        payload = {
+            "source": "Document_Manager",
+            "filename": filename,
+            "raw_text": raw_text,
+            "pending_id": pending_id,
+        }
         try:
-            self._knowledge_base_path.write_text(
-                json.dumps(entries, indent=2, ensure_ascii=False),
-                encoding="utf-8",
+            with httpx.Client(timeout=120.0) as client:
+                resp = client.post(url, json=payload)
+                resp.raise_for_status()
+                return resp.json()
+        except httpx.ConnectError:
+            logger.error(
+                "Core API unreachable at %s — file %s kept in inbox (pending_id=%s)",
+                _CORE_API_URL,
+                filename,
+                pending_id,
             )
-        except OSError as exc:
-            logger.warning("Could not write knowledge_base.json: %s", exc)
-
-    def _add_to_knowledge_base(
-        self,
-        archived_filename: str,
-        meta: dict[str, str],
-        full_text_path: str,
-    ) -> None:
-        kb = self._load_knowledge_base()
-        kb.append({
-            "filename": archived_filename,
-            "category": meta.get("category", "Unknown"),
-            "document_type": meta.get("document_type", "Unknown"),
-            "provider": meta.get("provider", ""),
-            "date": meta.get("date", "Unknown"),
-            "summary": meta.get("summary", ""),
-            "full_text_path": full_text_path,
-            "archived_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        })
-        self._save_knowledge_base(kb)
-
-    def _save_to_document_memory(self, smart_name: str, text: str) -> Path:
-        """Persist cleaned text in internal/document_memory."""
-        txt_name = f"{Path(smart_name).stem}.txt"
-        out = self._doc_memory / txt_name
-        if out.exists():
-            stem = out.stem
-            out = self._doc_memory / f"{stem}_{int(time.time())}.txt"
-        out.write_text(text, encoding="utf-8")
-        return out
-
-    def _cleanup_temp_files(self, filename: str) -> None:
-        """Remove transient copies from temp_backup and extracted_texts after archiving."""
-        stem = Path(filename).stem
-        for d, patterns in [
-            (self._temp_backup, [filename]),
-            (self._texts_dir, [f"{stem}.txt"]),
-        ]:
-            for pattern in patterns:
-                target = d / pattern
-                try:
-                    if target.is_file():
-                        target.unlink()
-                        logger.info("Cleaned up %s", target)
-                except OSError as exc:
-                    logger.debug("Cleanup failed for %s: %s", target, exc)
-
-    def _ingest_to_memory(
-        self,
-        filename: str,
-        cleaned_text: str,
-        meta: dict[str, str],
-    ) -> None:
-        """Push the cleaned document text + metadata into the RAG long-term memory."""
-        mm = self._memory_manager
-        if mm is None:
-            return
-        if not getattr(mm, "archive_ready", False):
-            logger.info("Memory archive not ready — skipping ingestion for %s", filename)
-            return
-        try:
-            metadata = {
-                "category": meta.get("category", "Unknown"),
-                "document_type": meta.get("document_type", "Unknown"),
-                "provider": meta.get("provider", ""),
-                "date": meta.get("date", "Unknown"),
-                "source_file": filename,
-            }
-            mm.archive_add_texts([cleaned_text], [metadata])
             print(
-                f"Henry: Content of {filename} successfully added to local long-term memory.",
+                f"ERROR: Henry Core offline at {_CORE_API_URL}. "
+                f"'{filename}' remains in the inbox.",
                 flush=True,
             )
+            return None
+        except httpx.HTTPStatusError as exc:
+            logger.error(
+                "Core API returned HTTP %s for %s: %s",
+                exc.response.status_code,
+                filename,
+                exc.response.text[:500],
+            )
+            print(
+                f"ERROR: Core rejected processing of '{filename}' "
+                f"(HTTP {exc.response.status_code}). File kept in inbox.",
+                flush=True,
+            )
+            return None
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Memory ingestion failed for %s: %s", filename, exc)
+            logger.error("Core API call failed for %s: %s", filename, exc)
+            print(f"ERROR: Could not reach Core for '{filename}': {exc}", flush=True)
+            return None
+
+    def _cleanup_temp_files(self, filename: str) -> None:
+        """Remove transient copies from internal/temp after archiving."""
+        target = self._temp / filename
+        try:
+            if target.is_file():
+                target.unlink()
+                logger.info("Cleaned up %s", target)
+        except OSError as exc:
+            logger.debug("Cleanup failed for %s: %s", target, exc)
 
     # --- Learning loop (manual_review renames) -----------------------------
 
@@ -758,30 +820,11 @@ class HenryFileManager:
                 "year": date_candidate[:4] if date_candidate != "Unknown" else "Unknown",
                 "month": date_candidate[5:7] if date_candidate != "Unknown" else "Unknown",
                 "summary": "Learned from manual rename",
+                "grouping_special": "",
             }
-
-            text = ""
-            cached = self._extracted.get(f.name)
-            if cached:
-                text = cached
-            else:
-                try:
-                    text = self.extract_text(f)
-                except Exception:  # noqa: BLE001
-                    pass
-
-            doc_mem_path: Path | None = None
-            if text:
-                smart = self._build_smart_filename(meta, f.suffix)
-                doc_mem_path = self._save_to_document_memory(smart or f.name, text)
 
             dest = self.organize_file(f, meta)
             if dest is not None:
-                self._add_to_knowledge_base(
-                    dest.name,
-                    meta,
-                    str(doc_mem_path) if doc_mem_path else "",
-                )
                 learned.append({"file": f.name, "archived_as": dest.name, **meta})
                 print(
                     f"Henry learned: {f.name} → type='{doc_type}' provider='{provider}'",
@@ -819,41 +862,165 @@ class HenryFileManager:
         safe = re.sub(r'[<>:"/\\|?*]', "_", "_".join(parts))
         return f"{safe}{original_suffix}"
 
+    @staticmethod
+    def _enrich_ymd_from_date(meta: dict[str, str]) -> None:
+        """Infer year/month/day from ISO date string when segmentation is missing."""
+        raw = meta.get("date", "").strip()
+        m_iso = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", raw)
+        if not m_iso:
+            return
+        y, mo, d_part = m_iso.group(1), m_iso.group(2), m_iso.group(3)
+        if meta.get("year") in ("", "Unknown", None):
+            meta["year"] = y
+        if meta.get("month") in ("", "Unknown", None):
+            meta["month"] = mo
+        if meta.get("day") in ("", "Unknown", None):
+            meta["day"] = d_part
+
+    def _contract_entity_dirname(self, meta: dict[str, str]) -> str:
+        prov = meta.get("provider", "").strip()
+        if not prov:
+            return self._safe_dirname("Unknown_Counterparty")
+        return self._safe_dirname(prov)
+
+    def _derive_target_archive_dir(self, meta: dict[str, str], cat_base: Path) -> Path:
+        """Date-default and smart-folder rules under ``Archiv/<Domain>/``.
+
+        Payslips **always** anchor under ``Archiv/04_Arbeit/Lohnabrechnungen/``, per project rules.
+        Other layouts use *cat_base*:
+
+        - Payslips: ``04_Arbeit/Lohnabrechnungen/[Year]/[Month]``
+        - Contracts: ``Contracts/[Entity]`` (flat; no calendar folders)
+        - Optional AI grouping_special: ``<Folder>/[Year]/[Month]/[Day]``
+        - Default: ``[Year]/[Month]/[Day]``
+        """
+        HenryFileManager._enrich_ymd_from_date(meta)
+
+        year = self._safe_dirname(meta.get("year", "Unknown"))
+        month = self._safe_dirname(meta.get("month", "Unknown"))
+        day = self._safe_dirname(meta.get("day", "Unknown"))
+
+        arbeit_base = self._categories["Arbeit"]
+        if _is_lohnabrechnung(meta):
+            return arbeit_base / "Lohnabrechnungen" / year / month
+
+        if _is_contract_document(meta):
+            return cat_base / "Contracts" / self._contract_entity_dirname(meta)
+
+        gs_raw = meta.get("grouping_special", "").strip()
+        if gs_raw and gs_raw.lower() not in ("unknown", ""):
+            group_folder = self._safe_dirname(gs_raw.replace(" ", "_"))
+            if group_folder and group_folder != "Unknown":
+                return cat_base / group_folder / year / month / day
+
+        return cat_base / year / month / day
+
+    def _resolve_destination_from_user_path(
+        self,
+        raw: str,
+        src: Path,
+        *,
+        smart_name: str,
+    ) -> tuple[Path | None, str | None]:
+        """Resolve a chat-typed archive path beneath ``Henry root`` / ``Archiv``.
+
+        Returns ``(destination_file_path, error_message)``. When *error_message* is
+        set, *destination_file_path* is ``None``.
+        """
+        cleaned = raw.strip().strip("`").strip('"').strip("'")
+        if not cleaned:
+            return None, "empty user_destination"
+
+        suffix = src.suffix
+        treats_as_file = cleaned.lower().endswith(suffix.lower())
+
+        normalized = cleaned.replace("\\", "/")
+        while normalized.startswith("Archiv/"):
+            normalized = normalized[len("Archiv/") :]
+
+        trial_paths: list[Path] = []
+        if Path(cleaned).is_absolute():
+            trial_paths.append(Path(cleaned))
+        else:
+            trial_paths.append(self._archive / normalized)
+            trial_paths.append(self._root / normalized)
+            trial_paths.append(self._root / "Archiv" / normalized)
+
+        archive_r = self._archive.resolve()
+        root_r = self._root.resolve()
+
+        anchor: Path | None = None
+        for cand in trial_paths:
+            resolved = cand.resolve()
+            if _is_under_tree(resolved, archive_r) or _is_under_tree(resolved, root_r):
+                anchor = cand
+                break
+
+        if anchor is None:
+            return None, "path must stay under Henry root or Archiv"
+
+        if treats_as_file:
+            dest_file = anchor
+        else:
+            os.makedirs(anchor, exist_ok=True)
+            fname = smart_name if smart_name else src.name
+            dest_file = anchor / fname
+
+        os.makedirs(dest_file.parent, exist_ok=True)
+        return dest_file, None
+
     def organize_file(
         self,
         file_path: Path | str,
         meta: dict[str, str],
     ) -> Path | None:
         """
-        Rename and move *file_path* into a category folder:
-        ``<category>/<year>/<month>/YYYY-MM-DD_Type_Provider<ext>``
+        Move *file_path* into ``Archiv`` using date-based defaults and smart grouping.
 
-        Provider is optional — skipped in the filename if empty.
-        Only fails if category is missing.
+        User override: when ``meta['user_destination']`` is set (from chat), all
+        filing heuristics are skipped and the file is placed exactly there
+        (directory or full file path under Henry root / Archiv).
+
+        Otherwise:
+        - Default: ``<Domain>/[Year]/[Month]/[Day]/``
+        - Payslips: ``04_Arbeit/Lohnabrechnungen/[Year]/[Month]/``
+        - Contracts: ``<Domain>/Contracts/[Entity]/``
+        - ``grouping_special``: ``<Domain>/<Group>/[Year]/[Month]/[Day]/``
         """
         src = Path(file_path)
         if not src.is_file():
             logger.warning("organize_file: source does not exist — %s", src)
             return None
 
-        category = meta.get("category", "Unknown")
-        cat_base = self._categories.get(category)
-        if cat_base is None:
-            logger.warning("organize_file: unknown category '%s'", category)
-            return None
-
-        year = self._safe_dirname(meta.get("year", "Unknown"))
-        month = self._safe_dirname(meta.get("month", "Unknown"))
-
-        target_dir = cat_base / year / month
-        target_dir.mkdir(parents=True, exist_ok=True)
+        meta = dict(meta)
+        HenryFileManager._enrich_ymd_from_date(meta)
+        user_dest = meta.get("user_destination", "").strip()
 
         smart_name = self._build_smart_filename(meta, src.suffix)
-        dest = target_dir / (smart_name if smart_name else src.name)
+
+        if user_dest:
+            dest, err = self._resolve_destination_from_user_path(
+                user_dest,
+                src,
+                smart_name=smart_name,
+            )
+            if err:
+                logger.warning("organize_file: user_destination rejected — %s", err)
+                return None
+        else:
+            category = meta.get("category", "Unknown")
+            cat_base = self._categories.get(category)
+            if cat_base is None:
+                logger.warning("organize_file: unknown category '%s'", category)
+                return None
+
+            target_dir = self._derive_target_archive_dir(meta, cat_base)
+            os.makedirs(target_dir, exist_ok=True)
+            dest = target_dir / (smart_name if smart_name else src.name)
 
         if dest.exists():
             stem, suffix = dest.stem, dest.suffix
-            dest = target_dir / f"{stem}_{int(time.time())}{suffix}"
+            dest = dest.parent / f"{stem}_{int(time.time())}{suffix}"
 
         try:
             shutil.move(str(src), str(dest))
@@ -864,11 +1031,11 @@ class HenryFileManager:
             return None
 
     def list_processing(self) -> list[Path]:
-        """Return files currently sitting in temp_backup awaiting processing."""
-        if not self._temp_backup.is_dir():
+        """Return files currently sitting in internal/temp awaiting processing."""
+        if not self._temp.is_dir():
             return []
         return sorted(
-            p for p in self._temp_backup.iterdir()
+            p for p in self._temp.iterdir()
             if p.is_file() and p.name not in _IGNORED_FILES and not p.name.startswith("._")
         )
 
@@ -900,25 +1067,17 @@ class HenryFileManager:
         logger.warning("Unsupported file type for OCR: %s", ext)
         return ""
 
-    def _persist_extracted_text(self, source_name: str, text: str) -> Path:
-        """Write extracted text to disk so it can be used for training or archiving."""
-        out = self._texts_dir / f"{Path(source_name).stem}.txt"
-        out.write_text(text, encoding="utf-8")
-        return out
 
     # --- Inbox processing --------------------------------------------------
 
     def process_inbox(self) -> list[dict[str, Any]]:
         """
-        Process every file in ``temp_backup``:
+        Process files in ``internal/temp``:
 
-        1. OCR-extract text from the backup copy
-        2. Persist the text for later training / archiving use
-        3. Classify via ``classify_document`` (local Ollama LLM)
-        4. Stage the file into ``internal/pending/`` and build a proposal
-        5. On OCR/classification failure → move original to ``manual_review``
-
-        Returns a list of proposal dicts (one per file) for Telegram confirmation.
+        1. OCR-extract text (pytesseract / pdf2image)
+        2. Assign ``pending_id`` and stage under ``internal/pending/``
+        3. POST raw text to Core API ``/v1/process``
+        4. On failure → keep inbox file; move to manual_review only when OCR fails
         """
         results: list[dict[str, Any]] = []
         for backup_path in self.list_processing():
@@ -926,21 +1085,23 @@ class HenryFileManager:
             inbox_original = self.inbox / filename
             entry: dict[str, Any] = {"file": filename}
 
-            failed = False
-
             try:
                 text = self.extract_text(backup_path)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("OCR failed for %s: %s", filename, exc)
                 entry["error"] = str(exc)
-                failed = True
-                text = ""
+                if inbox_original.is_file():
+                    review_dest = self._move_to_manual_review(inbox_original)
+                    entry["moved_to"] = str(review_dest) if review_dest else None
+                try:
+                    backup_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                results.append(entry)
+                continue
 
-            if not failed and not text:
+            if not text.strip():
                 entry["error"] = "no_text_extracted"
-                failed = True
-
-            if failed:
                 if inbox_original.is_file():
                     review_dest = self._move_to_manual_review(inbox_original)
                     entry["moved_to"] = str(review_dest) if review_dest else None
@@ -951,56 +1112,11 @@ class HenryFileManager:
                 results.append(entry)
                 continue
 
-            self._extracted[filename] = text
-            text_file = self._persist_extracted_text(filename, text)
-            entry["text_file"] = str(text_file)
+            print(f"Henry OCR preview ({filename}): {text[:200]}", flush=True)
 
-            debug_name = f"{Path(filename).stem}.txt"
-            debug_path = self._debug_texts / debug_name
-            debug_path.write_text(text, encoding="utf-8")
-            print(f"DEBUG: Raw OCR saved to internal/debug_texte/{debug_name}", flush=True)
-            print(f"DEBUG: Raw preview → {text[:200]}", flush=True)
-
-            time.sleep(2)
-
-            print(f"Henry cleaning OCR text for {filename}…", flush=True)
-            cleaned_text = _clean_ocr_text(text)
-            entry["text_cleaned"] = cleaned_text != text
-
-            cleaned_debug = self._debug_texts / f"{Path(filename).stem}_cleaned.txt"
-            cleaned_debug.write_text(cleaned_text, encoding="utf-8")
-            print(f"DEBUG: Cleaned text saved to internal/debug_texte/{Path(filename).stem}_cleaned.txt", flush=True)
-            print(f"DEBUG: Cleaned preview → {cleaned_text[:200]}", flush=True)
-
-            time.sleep(2)
-
-            meta = classify_document(cleaned_text)
-            entry["classification"] = meta
-
-            if not _has_category(meta):
-                logger.warning("No category could be determined for %s", filename)
-                entry["error"] = "no_category"
-                if inbox_original.is_file():
-                    review_dest = self._move_to_manual_review(inbox_original)
-                    entry["moved_to"] = str(review_dest) if review_dest else None
-                try:
-                    backup_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
-                print(
-                    f"Henry could not categorise {filename} → moved to manual_review",
-                    flush=True,
-                )
-                results.append(entry)
-                continue
-
-            smart_name = self._build_smart_filename(meta, backup_path.suffix) or filename
-            entry["proposed_name"] = smart_name
-
-            pending_dest = self._pending / filename
-            if pending_dest.exists():
-                stem, suffix = pending_dest.stem, pending_dest.suffix
-                pending_dest = self._pending / f"{stem}_{int(time.time())}{suffix}"
+            pending_id = uuid.uuid4().hex[:12]
+            staged_name = f"{pending_id}_{filename}"
+            pending_dest = self._pending / staged_name
             try:
                 shutil.move(str(backup_path), str(pending_dest))
             except OSError as exc:
@@ -1009,355 +1125,183 @@ class HenryFileManager:
                 results.append(entry)
                 continue
 
-            pending_id = pending_dest.stem
-            self._pending_items[pending_id] = {
-                "pending_path": pending_dest,
-                "inbox_original": inbox_original,
-                "meta": meta,
-                "proposed_name": smart_name,
-                "cleaned_text": cleaned_text,
-                "original_filename": filename,
-            }
+            record = _PendingRecord(
+                pending_id=pending_id,
+                staged_path=pending_dest,
+                inbox_path=inbox_original,
+                filename=filename,
+                raw_text=text,
+            )
+            self._register_pending(record)
+
+            core_response = self._post_to_core(pending_id, filename, text)
+            if core_response is None:
+                entry["error"] = "core_unreachable"
+                entry["pending_id"] = pending_id
+                results.append(entry)
+                continue
+
             entry["pending_id"] = pending_id
             entry["status"] = "awaiting_confirmation"
-
+            entry["classification"] = {
+                "category": core_response.get("category"),
+                "document_type": core_response.get("document_type"),
+                "provider": core_response.get("provider"),
+                "proposed_name": core_response.get("proposed_name"),
+                "grouping_suggestion": core_response.get("grouping_suggestion") or "",
+            }
             print(
-                f"Henry staged {filename} → pending (proposed: {smart_name}, "
-                f"category: {meta.get('category')})",
+                f"Henry: sent {filename} to Core (pending_id={pending_id}, "
+                f"category={core_response.get('category')})",
                 flush=True,
             )
             results.append(entry)
 
         return results
 
-    # --- Confirmation / override from Telegram -----------------------------
+    # --- Archive execution (inbound from Core) ------------------------------
 
-    def confirm_pending(self, pending_id: str) -> dict[str, Any] | None:
-        """User replied OK — finalize archiving for this pending item."""
-        item = self._pending_items.pop(pending_id, None)
-        if item is None:
-            return None
+    def execute_archive(self, cmd: ArchiveExecuteCommand) -> dict[str, Any]:
+        """Physically move a staged file into Archiv/ after Core approval."""
+        record = self._get_pending(cmd.pending_id)
+        if record is None:
+            raise ValueError(f"Unknown pending_id: {cmd.pending_id}")
 
-        pending_path: Path = item["pending_path"]
-        inbox_original: Path = item["inbox_original"]
-        meta: dict[str, str] = item["meta"]
-        cleaned_text: str = item["cleaned_text"]
-        filename: str = item["original_filename"]
+        if not record.staged_path.is_file():
+            raise ValueError(f"Staged file missing for pending_id={cmd.pending_id}")
 
-        if not pending_path.is_file():
-            logger.warning("confirm_pending: file gone from pending — %s", pending_path)
-            return None
+        meta: dict[str, str] = dict(cmd.classification or {})
+        if cmd.metadata_override:
+            meta.update(cmd.metadata_override)
 
-        dest = self.organize_file(pending_path, meta)
-        if dest is None:
-            if inbox_original.is_file():
-                self._move_to_manual_review(inbox_original)
-            return {"file": filename, "error": "archive_failed"}
+        user_requested_path = meta.get("user_destination", "").strip()
 
-        doc_mem_path = self._save_to_document_memory(dest.name, cleaned_text)
-        self._add_to_knowledge_base(dest.name, meta, str(doc_mem_path))
-        self._ingest_to_memory(filename, cleaned_text, meta)
+        if cmd.action == "edit" and not meta.get("category"):
+            raise ValueError("edit action requires classification metadata")
 
-        if inbox_original.is_file():
-            try:
-                inbox_original.unlink()
-            except OSError as exc:
-                logger.warning("Could not delete inbox original %s: %s", filename, exc)
-
-        self._cleanup_temp_files(filename)
-
-        print(
-            f"Henry confirmed {filename} → "
-            f"category='{meta.get('category')}' "
-            f"type='{meta.get('document_type')}' "
-            f"provider='{meta.get('provider') or '—'}' "
-            f"date='{meta.get('date')}'",
-            flush=True,
-        )
-        return {
-            "file": filename,
-            "archived_to": str(dest),
-            "classification": meta,
-        }
-
-    def override_pending(
-        self,
-        pending_id: str,
-        new_category: str,
-        new_name: str | None = None,
-    ) -> dict[str, Any] | None:
-        """User corrected the classification — re-classify, archive, and learn."""
-        item = self._pending_items.pop(pending_id, None)
-        if item is None:
-            return None
-
-        pending_path: Path = item["pending_path"]
-        inbox_original: Path = item["inbox_original"]
-        old_meta: dict[str, str] = item["meta"]
-        cleaned_text: str = item["cleaned_text"]
-        filename: str = item["original_filename"]
-
-        if not pending_path.is_file():
-            logger.warning("override_pending: file gone from pending — %s", pending_path)
-            return None
-
-        cat_key = new_category
+        cat_key = meta.get("category", "Unknown")
         for key, folder in CATEGORY_FOLDERS.items():
-            if new_category == folder or new_category.lower() == key.lower():
+            if cat_key == folder or cat_key.lower() == key.lower():
                 cat_key = key
                 break
-
         if cat_key not in CATEGORY_FOLDERS:
-            logger.warning("override_pending: unknown category '%s'", cat_key)
-            return {"file": filename, "error": f"unknown_category: {new_category}"}
+            if user_requested_path:
+                cat_key = "Korrespondenz"
+            else:
+                raise ValueError(f"Unknown category: {meta.get('category')}")
 
-        new_meta = dict(old_meta)
-        new_meta["category"] = cat_key
+        meta["category"] = cat_key
+        for field in ("document_type", "provider", "date", "year", "month", "summary"):
+            meta.setdefault(field, "Unknown")
+        meta.setdefault("grouping_special", "")
+        if meta.get("grouping_special") in ("Unknown", None):
+            meta["grouping_special"] = ""
+        meta.setdefault("day", "Unknown")
+        if meta.get("provider") == "Unknown":
+            meta["provider"] = ""
 
-        if new_name:
-            new_meta["document_type"] = new_name
-
-        smart_name = self._build_smart_filename(new_meta, pending_path.suffix) or filename
-        if new_name and not self._build_smart_filename(new_meta, pending_path.suffix):
-            safe = re.sub(r'[<>:"/\\|?*]', "_", new_name)
-            smart_name = f"{safe}{pending_path.suffix}"
-
-        dest = self.organize_file(pending_path, new_meta)
+        dest = self.organize_file(record.staged_path, meta)
         if dest is None:
-            if inbox_original.is_file():
-                self._move_to_manual_review(inbox_original)
-            return {"file": filename, "error": "archive_failed"}
+            if record.inbox_path.is_file():
+                self._move_to_manual_review(record.inbox_path)
+            return {"file": record.filename, "error": "archive_failed"}
 
-        doc_mem_path = self._save_to_document_memory(dest.name, cleaned_text)
-        self._add_to_knowledge_base(dest.name, new_meta, str(doc_mem_path))
-        self._ingest_to_memory(filename, cleaned_text, new_meta)
+        self._pop_pending(cmd.pending_id)
 
-        self._record_correction(filename, old_meta, new_meta)
-
-        if inbox_original.is_file():
+        if record.inbox_path.is_file():
             try:
-                inbox_original.unlink()
+                record.inbox_path.unlink()
             except OSError as exc:
-                logger.warning("Could not delete inbox original %s: %s", filename, exc)
+                logger.warning("Could not delete inbox original %s: %s", record.filename, exc)
 
-        self._cleanup_temp_files(filename)
+        self._cleanup_temp_files(record.filename)
 
         print(
-            f"Henry corrected {filename} → "
-            f"category='{new_meta.get('category')}' "
-            f"type='{new_meta.get('document_type')}' "
-            f"(user override)",
+            f"Henry archived {record.filename} → {dest} "
+            f"(pending_id={cmd.pending_id})",
             flush=True,
         )
         return {
-            "file": filename,
+            "file": record.filename,
             "archived_to": str(dest),
-            "classification": new_meta,
-            "was_corrected": True,
+            "classification": meta,
+            "pending_id": cmd.pending_id,
         }
-
-    def _record_correction(
-        self,
-        filename: str,
-        old_meta: dict[str, str],
-        new_meta: dict[str, str],
-    ) -> None:
-        """Record a user correction in the knowledge base so Henry can learn."""
-        kb = self._load_knowledge_base()
-        kb.append({
-            "type": "correction",
-            "filename": filename,
-            "original_classification": {
-                "category": old_meta.get("category", "Unknown"),
-                "document_type": old_meta.get("document_type", "Unknown"),
-                "provider": old_meta.get("provider", ""),
-            },
-            "corrected_to": {
-                "category": new_meta.get("category", "Unknown"),
-                "document_type": new_meta.get("document_type", "Unknown"),
-                "provider": new_meta.get("provider", ""),
-            },
-            "corrected_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        })
-        self._save_knowledge_base(kb)
-        print(
-            f"Henry learned: {filename} should be "
-            f"'{new_meta.get('category')}' / '{new_meta.get('document_type')}' "
-            f"(was '{old_meta.get('category')}' / '{old_meta.get('document_type')}')",
-            flush=True,
-        )
 
     def get_pending_ids(self) -> list[str]:
-        """Return all pending item IDs awaiting user confirmation."""
-        return list(self._pending_items.keys())
+        with self._pending_lock:
+            return list(self._pending_files.keys())
 
-    def get_extracted_text(self, filename: str) -> str | None:
-        """Retrieve cached OCR text for a previously processed file."""
-        return self._extracted.get(filename)
 
-    # --- Repair / re-index -------------------------------------------------
+def create_worker_app(manager: HenryFileManager) -> FastAPI:
+    """Inbound API for archive commands from the Core Router."""
+    app = FastAPI(title="Henry Document Worker", version="0.1.0")
 
-    def repair_knowledge_base(self) -> dict[str, Any]:
-        """Fix stale KB entries and re-index archive files missing from knowledge_base.json.
-
-        Phase 1 — fix existing entries:
-          - Add missing ``category`` field by locating the file in the archive
-          - Fix ``full_text_path`` if the referenced file no longer exists
-          - Remove entries whose archive file no longer exists
-
-        Phase 2 — re-index orphans:
-          - Scan Archiv/ for files not present in the KB
-          - Derive metadata from folder path + filename
-          - OCR + clean if no text file exists in document_memory
-          - Ingest into the vector store
-
-        Returns a summary dict.
-        """
-        kb = self._load_knowledge_base()
-
-        archive_index: dict[str, tuple[str, Path]] = {}
-        if self._archive.is_dir():
-            for cat_key, cat_folder in CATEGORY_FOLDERS.items():
-                cat_dir = self._archive / cat_folder
-                if not cat_dir.is_dir():
-                    continue
-                for fp in cat_dir.rglob("*"):
-                    if fp.is_file() and fp.name not in _IGNORED_FILES and not fp.name.startswith("._"):
-                        archive_index[fp.name] = (cat_key, fp)
-
-        fixed_entries = 0
-        pruned = 0
-        cleaned_kb: list[dict[str, Any]] = []
-        for entry in kb:
-            if entry.get("type") == "correction":
-                cleaned_kb.append(entry)
-                continue
-            fn = entry.get("filename", "")
-            if not fn:
-                continue
-            if fn not in archive_index:
-                pruned += 1
-                print(f"Henry repair: pruned stale KB entry for missing file {fn}", flush=True)
-                continue
-
-            cat_key, file_path = archive_index[fn]
-            changed = False
-
-            if not entry.get("category") or entry.get("category") == "Unknown":
-                entry["category"] = cat_key
-                changed = True
-
-            text_path = entry.get("full_text_path", "")
-            if text_path and not Path(text_path).is_file():
-                new_path = self._doc_memory / f"{Path(fn).stem}.txt"
-                if new_path.is_file():
-                    entry["full_text_path"] = str(new_path)
-                else:
-                    entry["full_text_path"] = ""
-                changed = True
-
-            if changed:
-                fixed_entries += 1
-                print(f"Henry repair: fixed KB entry for {fn}", flush=True)
-
-            cleaned_kb.append(entry)
-
-        known_files = {e.get("filename") for e in cleaned_kb if e.get("filename")}
-
-        repaired: list[str] = []
-        skipped: list[str] = []
-
-        for filename, (cat_key, file_path) in archive_index.items():
-            if filename in known_files:
-                continue
-
-            cat_dir = self._archive / CATEGORY_FOLDERS[cat_key]
-            rel = file_path.relative_to(cat_dir)
-            parts = rel.parts
-            year = parts[0] if len(parts) > 1 else "Unknown"
-            month = parts[1] if len(parts) > 2 else "Unknown"
-
-            doc_type = "Unknown"
-            provider = ""
-            date = "Unknown"
-            stem_parts = file_path.stem.split("_")
-            if stem_parts and re.match(r"\d{4}-\d{2}-\d{2}$", stem_parts[0]):
-                date = stem_parts[0]
-            if len(stem_parts) >= 2:
-                doc_type = stem_parts[1]
-            if len(stem_parts) >= 3:
-                provider = stem_parts[2]
-
-            meta: dict[str, str] = {
-                "category": cat_key,
-                "document_type": doc_type,
-                "provider": provider,
-                "date": date,
-                "year": year,
-                "month": month,
-                "summary": "Re-indexed by repair function",
-            }
-
-            doc_mem_text = ""
-            txt_name = f"{file_path.stem}.txt"
-            doc_mem_file = self._doc_memory / txt_name
-            if doc_mem_file.is_file():
-                try:
-                    doc_mem_text = doc_mem_file.read_text(encoding="utf-8")
-                except OSError:
-                    pass
-
-            if not doc_mem_text and file_path.suffix.lower() in _SUPPORTED_EXTS:
-                try:
-                    raw = self.extract_text(file_path)
-                    if raw:
-                        doc_mem_text = _clean_ocr_text(raw)
-                        self._save_to_document_memory(file_path.name, doc_mem_text)
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("Repair OCR failed for %s: %s", file_path.name, exc)
-                    skipped.append(file_path.name)
-                    continue
-
-            full_text_path = str(doc_mem_file) if doc_mem_file.is_file() else ""
-            cleaned_kb.append({
-                "filename": filename,
-                "category": cat_key,
-                "document_type": doc_type,
-                "provider": provider,
-                "date": date,
-                "summary": "Re-indexed by repair function",
-                "full_text_path": full_text_path,
-                "archived_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-            })
-
-            if doc_mem_text:
-                self._ingest_to_memory(file_path.name, doc_mem_text, meta)
-
-            repaired.append(file_path.name)
-            print(
-                f"Henry repair: re-indexed {file_path.name} "
-                f"(category={cat_key}, type={doc_type})",
-                flush=True,
-            )
-
-        self._save_knowledge_base(cleaned_kb)
-
-        total_actions = fixed_entries + pruned + len(repaired)
-        result = {
-            "fixed_entries": fixed_entries,
-            "pruned": pruned,
-            "repaired": len(repaired),
-            "skipped": len(skipped),
-            "files": repaired,
-            "skipped_files": skipped,
+    @app.get("/status")
+    def worker_status() -> dict[str, Any]:
+        return {
+            "service": "henry-document-worker",
+            "inbox": str(manager.inbox.resolve()),
+            "pending_count": len(manager.get_pending_ids()),
+            "core_api_url": _CORE_API_URL,
         }
-        if total_actions:
-            print(
-                f"Henry repair complete: {fixed_entries} entries fixed, "
-                f"{pruned} stale entries pruned, {len(repaired)} orphan file(s) re-indexed, "
-                f"{len(skipped)} skipped.",
-                flush=True,
-            )
-        else:
-            print("Henry repair: knowledge base is healthy. Nothing to fix.", flush=True)
-        return result
+
+    @app.post("/v1/archive/execute")
+    def archive_execute(cmd: ArchiveExecuteCommand) -> dict[str, Any]:
+        try:
+            return manager.execute_archive(cmd)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("archive_execute failed for %s", cmd.pending_id)
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    return app
+
+
+def _configure_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        stream=sys.stdout,
+    )
+
+
+def _run_worker_service() -> None:
+    _configure_logging()
+
+    manager = HenryFileManager()
+    worker_app = create_worker_app(manager)
+
+    import uvicorn
+
+    reclaim_tcp_listen_port(_WORKER_API_PORT, role="worker")
+
+    def _serve_api() -> None:
+        uvicorn.run(
+            worker_app,
+            host=_WORKER_API_HOST,
+            port=_WORKER_API_PORT,
+            log_level="info",
+        )
+
+    api_thread = threading.Thread(target=_serve_api, name="henry-worker-api", daemon=True)
+    api_thread.start()
+    print(
+        f"Henry Document Worker API: http://{_WORKER_API_HOST}:{_WORKER_API_PORT}",
+        flush=True,
+    )
+
+    manager.start_watching()
+    print("Henry Document Worker: inbox watcher active.", flush=True)
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("Henry Document Worker: shutting down.", flush=True)
+        manager.stop_watching()
+
+
+if __name__ == "__main__":
+    _run_worker_service()
