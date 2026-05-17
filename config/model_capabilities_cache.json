@@ -1,0 +1,42 @@
+{
+  "claude_3_5_sonnet": {
+    "base_cost": 0.86,
+    "base_skill": 0.98,
+    "base_speed": 0.52
+  },
+  "gpt_4o": {
+    "base_cost": 0.72,
+    "base_skill": 0.9,
+    "base_speed": 0.57
+  },
+  "llama3.1:latest": {
+    "base_cost": 0.0,
+    "base_skill": 0.7,
+    "base_speed": 0.8
+  },
+  "mistral-nemo:latest": {
+    "base_cost": 0.0,
+    "base_skill": 0.75,
+    "base_speed": 0.6
+  },
+  "nomic-embed-text:latest": {
+    "base_cost": 0.0,
+    "base_skill": 0.1,
+    "base_speed": 0.7
+  },
+  "phi4:latest": {
+    "base_cost": 0.0,
+    "base_skill": 0.9,
+    "base_speed": 0.45
+  },
+  "qwen2.5:7b": {
+    "base_cost": 0.0,
+    "base_skill": 0.85,
+    "base_speed": 0.6
+  },
+  "qwen2_5": {
+    "base_cost": 0.0,
+    "base_skill": 0.85,
+    "base_speed": 0.6
+  }
+}

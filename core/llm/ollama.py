@@ -6,19 +6,32 @@ from typing import Sequence
 
 import httpx
 
-from core.llm.base import ChatMessage
+from core.llm.base import ChatMessage, GenerationParameters
 
 
 class OllamaLLMProvider:
-    def __init__(self, base_url: str, model: str, timeout_s: float = 120.0) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        model: str,
+        generation_parameters: GenerationParameters,
+        timeout_s: float = 120.0,
+    ) -> None:
         self._base_url = base_url.rstrip("/")
         self._model = model
+        self._generation_parameters = generation_parameters
         self._timeout = timeout_s
 
     def complete(self, messages: Sequence[ChatMessage]) -> str:
+        params = self._generation_parameters
         payload = {
             "model": self._model,
             "messages": [{"role": m.role, "content": m.content} for m in messages],
+            "options": {
+                "temperature": params.temperature,
+                "top_p": params.top_p,
+                "num_ctx": params.num_ctx,
+            },
             "stream": False,
         }
         url = f"{self._base_url}/api/chat"

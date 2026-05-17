@@ -12,6 +12,15 @@ class ChatMessage:
     content: str
 
 
+@dataclass(frozen=True)
+class GenerationParameters:
+    """Explicit generation controls loaded from config/routing_preferences.yaml."""
+
+    temperature: float
+    top_p: float
+    num_ctx: int
+
+
 @runtime_checkable
 class LLMProvider(Protocol):
     """Any chat-capable model backend (Ollama, HTTP APIs, etc.)."""

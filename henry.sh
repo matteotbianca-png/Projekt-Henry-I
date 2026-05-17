@@ -215,15 +215,15 @@ cmd_start() {
   : > "${LOG_UI}"
 
   log_info "🚀 Starting Henry Core API (port 8000)…"
-  nohup "${python_bin}" "${MAIN_PY}" >> "${LOG_CORE}" 2>&1 &
+  nohup env PYTHONUNBUFFERED=1 "${python_bin}" -u "${MAIN_PY}" >> "${LOG_CORE}" 2>&1 &
   local core_pid=$!
 
   log_info "🚀 Starting Document Worker (port 8001)…"
-  nohup "${python_bin}" "${WORKER_PY}" >> "${LOG_WORKER}" 2>&1 &
+  nohup env PYTHONUNBUFFERED=1 "${python_bin}" -u "${WORKER_PY}" >> "${LOG_WORKER}" 2>&1 &
   local worker_pid=$!
 
   log_info "🚀 Starting Telegram UI (port 8002)…"
-  nohup "${python_bin}" "${UI_PY}" >> "${LOG_UI}" 2>&1 &
+  nohup env PYTHONUNBUFFERED=1 "${python_bin}" -u "${UI_PY}" >> "${LOG_UI}" 2>&1 &
   local ui_pid=$!
 
   sleep 0.5
@@ -341,6 +341,37 @@ cmd_logs() {
   tail -f "${LOG_CORE}" "${LOG_WORKER}" "${LOG_UI}"
 }
 
+cmd_doctor() {
+  local status_url="http://127.0.0.1:8000/api/status"
+
+  if ! command -v curl >/dev/null 2>&1; then
+    log_err "curl is required for ./henry.sh doctor"
+    exit 1
+  fi
+
+  log_info "🩺 Querying Henry health matrix: ${status_url}"
+
+  local payload
+  if ! payload="$(curl --fail --silent --show-error --max-time 5 "${status_url}")"; then
+    log_err "Henry Core health endpoint is not reachable."
+    log_err "Start Henry first with: ./henry.sh start"
+    exit 1
+  fi
+
+  if command -v jq >/dev/null 2>&1; then
+    printf '%s\n' "${payload}" | jq .
+    return 0
+  fi
+
+  if command -v python3 >/dev/null 2>&1; then
+    printf '%s\n' "${payload}" | python3 -m json.tool
+    return 0
+  fi
+
+  log_warn "Neither jq nor python3 found; printing raw JSON."
+  printf '%s\n' "${payload}"
+}
+
 usage() {
   cat <<EOF
 Henry process control (native, no Docker)
@@ -353,6 +384,7 @@ Commands:
   stop     Stop the three recorded PIDs and remove ${PID_FILE}
   restart  stop → wait 1s → start
   logs     Follow logs_core.log, logs_worker.log, logs_ui.log together
+  doctor   Query Core /api/status and pretty-print the health matrix
 
 Python: services always run via ${VENV_PYTHON} (never global python3).
 
@@ -368,6 +400,7 @@ main() {
     stop)    cmd_stop ;;
     restart) cmd_restart ;;
     logs)    cmd_logs ;;
+    doctor)  cmd_doctor ;;
     -h|--help|help)
       usage
       exit 0

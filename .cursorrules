@@ -26,3 +26,18 @@ Multi-Model Scoring: The core routing engine dynamically routes queries based on
 Explain your Work: Every PR must contain a "What, Why & Security Impact" summary.
 
 Review Loop: Use separate branches; never push directly to main. Incremental, step-by-step refactoring only.
+
+# Project Henry: LLM Router Refactoring Rules
+
+## 1. Architectural Integrity & Plug-and-Play Boundaries
+- The LLM Router (`core/llm_manager.py`) is strictly the orchestration "Brain."
+- It must remain 100% decoupled from the Document Manager (`tools/file_manager.py`). 
+- Tools must interact with the Core API purely through clean interfaces (e.g., HTTP endpoints or decoupled function calls). Never mix file processing logic into the routing engine.
+
+## 2. Robust State & Failure Handling
+- On initialization, the system must perform an active discovery pass checking local Ollama models (`/api/tags`), cloud API keys, storage/memory mounts, and Microsoft Presidio availability.
+- If Microsoft Presidio is unresponsive during system boot or at runtime, the system must trigger a high-visibility warning and automatically lock down all operations to Tier 1 (Strict Local Only) to protect data sovereignty.
+- Avoid leaving dead or unresponsive references behind. When refactoring functions, clean up old variables, unused imports, or outdated fallback methods completely.
+
+## 3. Dynamic Configuration & Parameters
+- Models must not run on unconfigured parameters. All model calls must dynamically inject centralized generation parameters (`temperature`, `top_p`, `num_ctx`) provided by the routing configuration layer.

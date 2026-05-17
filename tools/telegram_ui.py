@@ -2,18 +2,23 @@
 
 from __future__ import annotations
 
+print("!!! HENRY IS LIVE !!! Telegram UI entrypoint reached", flush=True)
+
 import asyncio
+import contextlib
 import logging
 import os
+import re
+import signal
 import sys
 import threading
 from pathlib import Path
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from pydantic import BaseModel, Field
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import TelegramError
 from telegram.ext import (
     Application,
@@ -25,7 +30,6 @@ from telegram.ext import (
 )
 
 from core.env import load_project_env
-from tools.file_manager import CATEGORY_FOLDERS
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
@@ -36,6 +40,8 @@ logger = logging.getLogger(__name__)
 _CORE_API_URL = os.environ.get("HENRY_CORE_API_URL", "http://127.0.0.1:8000").rstrip("/")
 _UI_API_HOST = os.environ.get("HENRY_UI_API_HOST", "127.0.0.1")
 _UI_API_PORT = int(os.environ.get("HENRY_UI_API_PORT", "8002"))
+_TELEGRAM_POLL_INTERVAL = float(os.environ.get("HENRY_TELEGRAM_POLL_INTERVAL", "0.0"))
+_TELEGRAM_LONG_POLL_TIMEOUT = int(os.environ.get("HENRY_TELEGRAM_LONG_POLL_TIMEOUT", "50"))
 
 
 class ProposalNotifyPayload(BaseModel):
@@ -49,11 +55,20 @@ class ProposalNotifyPayload(BaseModel):
     error: str | None = None
 
 
+class SweepSummaryPayload(BaseModel):
+    """Inbound notification from Core when lazy archive self-cleaning runs."""
+
+    trigger_file: str = ""
+    archived_to: str = ""
+    result: dict[str, Any] = Field(default_factory=dict)
+
+
 def _configure_logging() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         stream=sys.stdout,
+        force=True,
     )
 
 
@@ -87,6 +102,45 @@ class TelegramUISatellite:
         self.bot_app_ref: list[Application] = []
         self.event_loop: asyncio.AbstractEventLoop | None = None
         self.awaiting_correction: dict[int, str] = {}
+        self.reply_prompt_documents: dict[int, str] = {}
+
+    @staticmethod
+    def _document_id_from_prompt_text(text: str | None) -> str:
+        if not text:
+            return ""
+        match = re.search(r"Document ID:\s*([A-Za-z0-9_-]+)", text)
+        return match.group(1).strip() if match else ""
+
+    async def _send_force_reply_prompt(
+        self,
+        *,
+        document_id: str,
+        reason: str,
+    ) -> None:
+        if not self.bot_app_ref:
+            return
+        prompt = (
+            f"{reason}\n\n"
+            f"Document ID: {document_id}\n"
+            "Reply to this message with the correction text.\n\n"
+            "Examples:\n"
+            "date should be 31.12.2025\n"
+            "provider should be AcmeCorp\n"
+            "this is a contract"
+        )
+        try:
+            sent = await self.bot_app_ref[0].bot.send_message(
+                chat_id=self.authorized_user_id,
+                text=prompt,
+                reply_markup=ForceReply(
+                    selective=True,
+                    input_field_placeholder="date should be 31.12.2025",
+                ),
+            )
+        except TelegramError as exc:
+            logger.warning("Could not send ForceReply correction prompt: %s", exc)
+            return
+        self.reply_prompt_documents[sent.message_id] = document_id
 
     async def send_proposal(self, entry: dict[str, Any]) -> None:
         if not self.bot_app_ref:
@@ -122,21 +176,22 @@ class TelegramUISatellite:
             "\U0001F4C4 Document Detected\n\n"
             f"File: {entry.get('file', '?')}\n"
             f"Proposed Name: {proposed_name}\n"
-            f"Category: {CATEGORY_FOLDERS.get(category, category)}\n"
+            f"Category: {category}\n"
             f"Type: {doc_type}\n"
             f"Provider: {provider}"
         )
         if group_hint:
-            text += f"\nSuggested sub-folder (optional): {group_hint}"
+            text += f"\nSuggested grouping (optional): {group_hint}"
+        text += f"\nDocument ID: {pending_id}"
         keyboard = InlineKeyboardMarkup([
             [
                 InlineKeyboardButton(
                     "\u2705 Best\u00e4tigen",
-                    callback_data=f"confirm_{pending_id}",
+                    callback_data=f"confirm:{pending_id}",
                 ),
                 InlineKeyboardButton(
                     "\u274c Korrigieren",
-                    callback_data=f"edit_{pending_id}",
+                    callback_data=f"edit:{pending_id}",
                 ),
             ]
         ])
@@ -148,6 +203,44 @@ class TelegramUISatellite:
             )
         except TelegramError as exc:
             logger.warning("Could not send proposal: %s", exc)
+            return
+        await self._send_force_reply_prompt(
+            document_id=pending_id,
+            reason="Document correction prompt",
+        )
+
+    async def send_sweep_summary(self, entry: dict[str, Any]) -> None:
+        """Send a concise lazy archive maintenance summary to the authorized user."""
+        if not self.bot_app_ref:
+            return
+
+        result = entry.get("result") or {}
+        moved = int(result.get("moved") or 0)
+        purged = int(result.get("purged") or 0)
+        vector_updates = int(result.get("vector_updates") or 0)
+        threshold = int(result.get("threshold") or 0)
+
+        text = (
+            "Archive Self-Cleaning Sweep\n\n"
+            f"Trigger: {entry.get('trigger_file') or 'archive write'}\n"
+            f"Moved files: {moved}\n"
+            f"Updated vector paths: {vector_updates}\n"
+            f"Removed empty folders: {purged}"
+        )
+        if threshold:
+            text += f"\nThreshold: every {threshold} archive writes"
+
+        archived_to = str(entry.get("archived_to") or "").strip()
+        if archived_to:
+            text += f"\nLatest archive path: {archived_to}"
+
+        try:
+            await self.bot_app_ref[0].bot.send_message(
+                chat_id=self.authorized_user_id,
+                text=text,
+            )
+        except TelegramError as exc:
+            logger.warning("Could not send sweep summary: %s", exc)
 
     async def _post_archive_confirm(self, payload: dict[str, Any]) -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=120.0) as client:
@@ -158,6 +251,12 @@ class TelegramUISatellite:
     async def _post_query(self, text: str) -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=300.0) as client:
             resp = await client.post(f"{_CORE_API_URL}/v1/query", json={"text": text})
+            resp.raise_for_status()
+            return resp.json()
+
+    async def _post_query_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            resp = await client.post(f"{_CORE_API_URL}/v1/query", json=payload)
             resp.raise_for_status()
             return resp.json()
 
@@ -233,8 +332,8 @@ class TelegramUISatellite:
 
         data = query.data or ""
 
-        if data.startswith("confirm_"):
-            pending_id = data[len("confirm_"):]
+        if data.startswith("confirm_") or data.startswith("confirm:"):
+            pending_id = data.split("_", 1)[1] if data.startswith("confirm_") else data.split(":", 1)[1]
             try:
                 result = await self._post_archive_confirm(
                     {"pending_id": pending_id, "action": "confirm"},
@@ -256,25 +355,20 @@ class TelegramUISatellite:
                 cat = meta.get("category", "?")
                 dest = worker_result.get("archived_to", "?")
                 await query.edit_message_text(
-                    f"\u2705 Archiviert in {CATEGORY_FOLDERS.get(cat, cat)}\n\n"
+                    f"\u2705 Archiviert in {cat}\n\n"
                     f"Type: {meta.get('document_type', '?')}\n"
                     f"Path: {dest}"
                 )
             return
 
-        if data.startswith("edit_"):
-            pending_id = data[len("edit_"):]
+        if data.startswith("edit_") or data.startswith("edit:"):
+            pending_id = data.split("_", 1)[1] if data.startswith("edit_") else data.split(":", 1)[1]
             self.awaiting_correction[self.authorized_user_id] = pending_id
-            await query.edit_message_text(
-                "\u270f\ufe0f Correction mode\n\n"
-                "Category + rename:\n"
-                "02_Finanzen: Neuer_Dateiname\n\n"
-                "Category only:\n"
-                "03_Versicherung\n\n"
-                "Exact archive path (overrides AI filing):\n"
-                "Archiv/04_Arbeit/Contracts/AcmeCorp\n"
-                "Archiv/02_Finanzen/2026/03/01"
+            await self._send_force_reply_prompt(
+                document_id=pending_id,
+                reason="Correction mode",
             )
+            await query.edit_message_reply_markup(reply_markup=None)
 
     async def handle_text(
         self,
@@ -293,28 +387,44 @@ class TelegramUISatellite:
             logger.info("Ignored message from unauthorized user_id=%s", uid)
             return
 
+        reply_doc_id = ""
+        reply_to_text = ""
+        if update.message.reply_to_message is not None:
+            reply_msg = update.message.reply_to_message
+            reply_to_text = reply_msg.text or reply_msg.caption or ""
+            reply_doc_id = self.reply_prompt_documents.get(reply_msg.message_id, "")
+            if not reply_doc_id:
+                reply_doc_id = self._document_id_from_prompt_text(reply_to_text)
+
+        if reply_doc_id:
+            self.awaiting_correction.pop(uid, None)
+            payload = {
+                "text": user_text,
+                "reply_to_document_id": reply_doc_id,
+                "reply_to_message_text": reply_to_text,
+                "source": "telegram_force_reply",
+            }
+            try:
+                result = await self._post_query_payload(payload)
+            except Exception as exc:  # noqa: BLE001
+                await update.message.reply_text(f"\u26a0\ufe0f Could not submit correction: {exc}")
+                return
+            if result.get("error"):
+                await update.message.reply_text(f"\u26a0\ufe0f Could not submit correction: {result['error']}")
+                return
+            await update.message.reply_text((result.get("reply") or "Correction received.").strip())
+            return
+
         if uid in self.awaiting_correction:
             pending_id = self.awaiting_correction.pop(uid)
-            ut = user_text.strip()
-
-            payload: dict[str, Any] = {
-                "pending_id": pending_id,
-                "action": "edit",
+            payload = {
+                "text": user_text,
+                "reply_to_document_id": pending_id,
+                "reply_to_message_text": f"Document ID: {pending_id}",
+                "source": "telegram_correction_mode",
             }
-
-            if "/" in ut or "\\" in ut or ut.lower().startswith("archiv"):
-                payload["user_destination"] = ut
-            elif ":" in ut:
-                segment = ut.split(":", 1)
-                override: dict[str, str] = {"category": segment[0].strip()}
-                if segment[1].strip():
-                    override["document_type"] = segment[1].strip()
-                payload["metadata_override"] = override
-            else:
-                payload["metadata_override"] = {"category": ut}
-
             try:
-                result = await self._post_archive_confirm(payload)
+                result = await self._post_query_payload(payload)
             except Exception as exc:  # noqa: BLE001
                 await update.message.reply_text(f"\u26a0\ufe0f Could not override: {exc}")
                 return
@@ -323,19 +433,7 @@ class TelegramUISatellite:
                 await update.message.reply_text(f"\u26a0\ufe0f Could not override: {result['error']}")
                 return
 
-            worker_result = result.get("worker_result") or {}
-            if result.get("worker_status") != "archived" or worker_result.get("error"):
-                err = worker_result.get("error") or result.get("worker_status", "unknown")
-                await update.message.reply_text(f"\u26a0\ufe0f Could not override: {err}")
-            else:
-                meta = result.get("classification") or {}
-                cat = meta.get("category", "?")
-                dest = worker_result.get("archived_to", "?")
-                await update.message.reply_text(
-                    f"\u2705 Korrigiert & archiviert in {CATEGORY_FOLDERS.get(cat, cat)}\n\n"
-                    f"Type: {meta.get('document_type', '?')}\n"
-                    f"Path: {dest}"
-                )
+            await update.message.reply_text((result.get("reply") or "Correction received.").strip())
             return
 
         try:
@@ -442,6 +540,14 @@ class TelegramUISatellite:
             return
         asyncio.run_coroutine_threadsafe(self.send_proposal(entry), loop)
 
+    def notify_sweep_summary_sync(self, entry: dict[str, Any]) -> None:
+        """Thread-safe bridge for lazy archive maintenance summaries."""
+        loop = self.event_loop
+        if loop is None or not loop.is_running():
+            logger.warning("Telegram loop not ready — dropping sweep summary")
+            return
+        asyncio.run_coroutine_threadsafe(self.send_sweep_summary(entry), loop)
+
 
 def create_ui_app(satellite: TelegramUISatellite) -> FastAPI:
     app = FastAPI(title="Henry Telegram UI API", version="0.1.0")
@@ -459,6 +565,11 @@ def create_ui_app(satellite: TelegramUISatellite) -> FastAPI:
         satellite.notify_proposal_sync(body.model_dump())
         return {"status": "queued", "pending_id": body.pending_id}
 
+    @app.post("/v1/ui/notify_sweep_summary")
+    def notify_sweep_summary(body: SweepSummaryPayload) -> dict[str, str]:
+        satellite.notify_sweep_summary_sync(body.model_dump())
+        return {"status": "queued"}
+
     return app
 
 
@@ -466,10 +577,27 @@ def _run_ui_api(satellite: TelegramUISatellite) -> None:
     import uvicorn
 
     ui_app = create_ui_app(satellite)
-    uvicorn.run(ui_app, host=_UI_API_HOST, port=_UI_API_PORT, log_level="info")
+    uvicorn.run(
+        ui_app,
+        host=_UI_API_HOST,
+        port=_UI_API_PORT,
+        log_level="info",
+        log_config=None,
+    )
 
 
-def run_telegram_ui_service() -> None:
+async def _wait_for_shutdown_signal() -> None:
+    shutdown = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        with contextlib.suppress(NotImplementedError):
+            loop.add_signal_handler(sig, shutdown.set)
+
+    await shutdown.wait()
+
+
+async def run_telegram_ui_service_async() -> None:
     _configure_logging()
     _check_telegram_dependencies()
 
@@ -489,12 +617,36 @@ def run_telegram_ui_service() -> None:
     application = satellite.build_telegram_application()
     print(
         "Henry Telegram UI: starting bot polling "
-        "(webhook cleared, pending updates dropped).",
+        f"(poll_interval={_TELEGRAM_POLL_INTERVAL}, "
+        f"long_poll_timeout={_TELEGRAM_LONG_POLL_TIMEOUT}s).",
         flush=True,
     )
-    application.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
+
+    await application.initialize()
+    await satellite.post_init(application)
+    if application.updater is None:
+        raise RuntimeError("Telegram application has no updater; polling cannot start.")
+
+    try:
+        await application.updater.start_polling(
+            poll_interval=_TELEGRAM_POLL_INTERVAL,
+            timeout=_TELEGRAM_LONG_POLL_TIMEOUT,
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+        )
+        await application.start()
+        await _wait_for_shutdown_signal()
+    finally:
+        if application.updater.running:
+            await application.updater.stop()
+        if application.running:
+            await application.stop()
+        await application.shutdown()
+
+
+def run_telegram_ui_service() -> None:
+    asyncio.run(
+        run_telegram_ui_service_async(),
     )
 
 

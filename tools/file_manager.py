@@ -6,6 +6,8 @@ via a local inbound API. No Telegram, LLM routing, or direct database access.
 
 from __future__ import annotations
 
+print("!!! HENRY IS LIVE !!! Document Worker entrypoint reached", flush=True)
+
 import json
 import logging
 import os
@@ -20,6 +22,7 @@ from typing import Any, Literal
 
 from core.env import load_project_env
 from core.port_guard import reclaim_tcp_listen_port
+from core.security import validate_safe_path
 
 load_project_env()
 
@@ -75,6 +78,8 @@ _CATEGORY_KEYWORDS: dict[str, list[str]] = {
         "mietzins", "mietvertrag", "liegenschaft", "vermieter", "mieter",
         "mietobjekt", "nettomiete", "wohnung", "nebenkosten", "heizkosten",
         "hauswart", "stockwerkeigentum", "kündigung der wohnung",
+        "gerichtsverfahren", "gericht", "klage", "rechtsstreit", "schlichtungsbehörde",
+        "mietgericht", "mietstreit", "mietrecht", "wohnungsklage",
     ],
     "Finanzen": [
         "valuta", "saldo", "kontoauszug", "iban", "zahlungseingang",
@@ -107,6 +112,17 @@ _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".gif"}
 _PDF_EXT = ".pdf"
 _SUPPORTED_EXTS = _IMAGE_EXTS | {_PDF_EXT}
 _IGNORED_FILES = {".DS_Store", "Thumbs.db", "._.DS_Store"}
+_SELF_CLEAN_STATE_FILE = "self_cleaning_state.json"
+
+
+def _env_positive_int(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.environ.get(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+_SELF_CLEAN_THRESHOLD = _env_positive_int("HENRY_SELF_CLEAN_THRESHOLD", 10)
 
 
 def _detect_category_by_keywords(text: str) -> str | None:
@@ -149,6 +165,11 @@ def _map_document_type_to_category(doc_type: str) -> str:
         "vertrag": "Korrespondenz",
         "letter": "Korrespondenz",
         "contract": "Korrespondenz",
+        "gerichtsverfahren": "Wohnen",
+        "klage": "Wohnen",
+        "rechtsstreit": "Wohnen",
+        "mietstreit": "Wohnen",
+        "mietrecht": "Wohnen",
     }
     return mapping.get(doc_type.lower(), "")
 
@@ -284,6 +305,10 @@ _CLASSIFY_SYSTEM_PROMPT = (
     "a recurring document type would clearly benefit from a dedicated folder "
     '(e.g. "Insurance Policies", "Steuerunterlagen"). Use empty string \"\" when '
     'the default date ladder [Year]/[Month]/[Day] under the Domain is appropriate.\n\n'
+    "SPECIAL HOUSING LEGAL RULE: Court cases, legal disputes, complaints, "
+    "Schlichtungsbehörde, Mietgericht, Mietstreit, or other legal documents "
+    "related to rent/living/housing MUST use category \"Wohnen\" and "
+    "grouping_special \"Gerichtsverfahren\".\n\n"
     "STEP 4 — PROVIDER / COUNTERPARTY: The company or person who sent/issued this document. "
     "Look in the header, letterhead, sender address, or signature block. "
     "If you see Swiss company names or specific addresses, use them. "
@@ -307,6 +332,7 @@ _CLASSIFY_SYSTEM_PROMPT = (
     '- For formal contracts ("Vertrag", "Contract"), classify correctly (e.g. '
     "\"Mietvertrag\"→Wohnen, \"Arbeitsvertrag\"→Arbeit) — Henry will archive under "
     "Contracts/<Entity> automatically.\n"
+    "- Housing/living legal disputes must be routed to Wohnen/Gerichtsverfahren/.\n"
     "- NEVER assign a synthetic 08_* domain folder; if nothing fits reasonably, "
     "pick the closest of the seven and mention the uncertainty in summary."
 )
@@ -337,6 +363,21 @@ _CONTRACT_DOCUMENT_MARKERS = (
     "unterzeichneter vertrag",
 )
 
+_HOUSING_LEGAL_MARKERS = (
+    "gerichtsverfahren",
+    "gericht",
+    "court case",
+    "legal dispute",
+    "rechtsstreit",
+    "klage",
+    "schlichtungsbehörde",
+    "mietgericht",
+    "mietstreit",
+    "mietrecht",
+    "mieterschutz",
+    "vermieterstreit",
+)
+
 
 def _is_lohnabrechnung(meta: dict[str, str]) -> bool:
     """Payslips use 04_Arbeit/Lohnabrechnungen/[Year]/[Month] (no day layer)."""
@@ -352,6 +393,84 @@ def _is_contract_document(meta: dict[str, str]) -> bool:
         return False
     dt = meta.get("document_type", "").lower()
     return any(marker in dt for marker in _CONTRACT_DOCUMENT_MARKERS)
+
+
+def _is_housing_legal_dispute(meta: dict[str, str]) -> bool:
+    """Housing/living court cases use 01_Wohnen/Gerichtsverfahren/."""
+    category = meta.get("category", "")
+    if category not in {"Wohnen", "01_Wohnen"}:
+        return False
+    haystack = " ".join(
+        str(meta.get(key, ""))
+        for key in ("document_type", "summary", "grouping_special", "provider")
+    ).lower()
+    return any(marker in haystack for marker in _HOUSING_LEGAL_MARKERS)
+
+
+def _normalise_correction_date(raw: str) -> str | None:
+    text = raw.strip()
+    iso = re.search(r"\b(\d{4})-(\d{2})-(\d{2})\b", text)
+    if iso:
+        return f"{iso.group(1)}-{iso.group(2)}-{iso.group(3)}"
+    swiss = re.search(r"\b(\d{1,2})\.(\d{1,2})\.(\d{4})\b", text)
+    if not swiss:
+        return None
+    day = int(swiss.group(1))
+    month = int(swiss.group(2))
+    year = int(swiss.group(3))
+    if 1 <= day <= 31 and 1 <= month <= 12:
+        return f"{year:04d}-{month:02d}-{day:02d}"
+    return None
+
+
+def resolve_correction_to_archive_payload(document_id: str, correction_text: str) -> dict[str, Any]:
+    """Convert raw UI correction text into a worker archive command payload."""
+    text = correction_text.strip()
+    if not text:
+        return {"status": "empty", "document_id": document_id}
+
+    payload: dict[str, Any] = {
+        "pending_id": document_id,
+        "action": "edit",
+    }
+    lowered = text.lower()
+
+    if "/" in text or "\\" in text or lowered.startswith("archiv"):
+        payload["user_destination"] = text
+        return {"status": "resolved", "document_id": document_id, "archive_command": payload}
+
+    if ":" in text:
+        category, value = text.split(":", 1)
+        override: dict[str, str] = {"category": category.strip()}
+        if value.strip():
+            override["document_type"] = value.strip()
+        payload["metadata_override"] = override
+        return {"status": "resolved", "document_id": document_id, "archive_command": payload}
+
+    correction_date = _normalise_correction_date(text)
+    if correction_date:
+        payload["metadata_override"] = {
+            "date": correction_date,
+            "year": correction_date[:4],
+            "month": correction_date[5:7],
+            "day": correction_date[8:10],
+        }
+        return {"status": "resolved", "document_id": document_id, "archive_command": payload}
+
+    category_aliases = {k.lower(): k for k in CATEGORY_FOLDERS}
+    category_aliases.update({v.lower(): k for k, v in CATEGORY_FOLDERS.items()})
+    normalized = lowered.strip()
+    if normalized == "mobilitaet":
+        normalized = "mobilität"
+    if normalized in category_aliases:
+        payload["metadata_override"] = {"category": category_aliases[normalized]}
+        return {"status": "resolved", "document_id": document_id, "archive_command": payload}
+
+    return {
+        "status": "queued_for_document_backend",
+        "document_id": document_id,
+        "correction_text": text,
+    }
 
 
 def _is_under_tree(path: Path, root: Path) -> bool:
@@ -517,6 +636,20 @@ class ArchiveExecuteCommand(BaseModel):
     )
 
 
+class DocumentClassifyRequest(BaseModel):
+    """Raw document text sent to the isolated document classifier."""
+
+    filename: str
+    raw_text: str
+
+
+class DocumentCorrectionResolveRequest(BaseModel):
+    """Raw UI correction text sent to the isolated document manager."""
+
+    document_id: str
+    correction_text: str
+
+
 class _PendingRecord:
     """Operational memory entry for a file awaiting archive approval."""
 
@@ -614,11 +747,13 @@ class HenryFileManager:
         self._internal = self._root / "internal"
         self._temp = self._internal / "temp"
         self._pending = self._internal / "pending"
+        self._self_clean_state = self._internal / _SELF_CLEAN_STATE_FILE
 
         self._ensure_dirs()
 
         self._observer: Observer | None = None
         self._pending_lock = threading.Lock()
+        self._self_clean_lock = threading.Lock()
         self._pending_files: dict[str, str] = {}
         self._pending_records: dict[str, _PendingRecord] = {}
 
@@ -633,7 +768,16 @@ class HenryFileManager:
             self._pending,
         ]
         for d in dirs:
-            d.mkdir(parents=True, exist_ok=True)
+            self._safe_makedirs(d)
+
+    def _safe_archive_path(self, path: Path) -> Path:
+        """Validate writes stay within the configured Henry storage root."""
+        return validate_safe_path(path, self._root)
+
+    def _safe_makedirs(self, path: Path) -> Path:
+        safe_path = self._safe_archive_path(path)
+        os.makedirs(safe_path, exist_ok=True)
+        return safe_path
 
     # --- Inbox watcher -----------------------------------------------------
 
@@ -642,14 +786,14 @@ class HenryFileManager:
         if self._observer is not None:
             return
 
-        os.makedirs(self._temp, exist_ok=True)
+        self._safe_makedirs(self._temp)
 
         inbox_abs = str(self.inbox.resolve())
         print(f"Henry is now watching: {inbox_abs}", flush=True)
 
         if not self.inbox.is_dir():
             print(f"WARNING: Inbox folder does not exist: {inbox_abs}", flush=True)
-            self.inbox.mkdir(parents=True, exist_ok=True)
+            self._safe_makedirs(self.inbox)
             print(f"  → Created it automatically.", flush=True)
 
         if not os.access(str(self.inbox), os.R_OK):
@@ -883,6 +1027,274 @@ class HenryFileManager:
             return self._safe_dirname("Unknown_Counterparty")
         return self._safe_dirname(prov)
 
+    def _load_self_clean_count(self) -> int:
+        if not self._self_clean_state.is_file():
+            return 0
+        try:
+            payload = json.loads(self._self_clean_state.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.debug("Self-clean state unreadable; resetting counter: %s", exc)
+            return 0
+        try:
+            return max(0, int(payload.get("write_count", 0)))
+        except (TypeError, ValueError):
+            return 0
+
+    def _store_self_clean_count(self, count: int) -> None:
+        payload = {
+            "write_count": max(0, int(count)),
+            "threshold": _SELF_CLEAN_THRESHOLD,
+            "updated_at": time.time(),
+        }
+        try:
+            self._safe_makedirs(self._internal)
+            self._self_clean_state.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            logger.debug("Could not persist self-clean counter: %s", exc)
+
+    def note_archive_write(self, memory_manager: Any | None = None) -> dict[str, Any]:
+        """Increment lazy write counter and opportunistically sweep at threshold.
+
+        This method is intentionally tiny for callers: invoke it after a document
+        has been physically archived or ingested. The routine stays self-contained
+        in this file and only uses *memory_manager* when supplied to synchronize
+        moved file paths in Chroma.
+        """
+        with self._self_clean_lock:
+            count = self._load_self_clean_count() + 1
+            if count < _SELF_CLEAN_THRESHOLD:
+                self._store_self_clean_count(count)
+                return {"write_count": count, "threshold": _SELF_CLEAN_THRESHOLD, "moved": 0, "purged": 0}
+
+            self._store_self_clean_count(0)
+
+        result = self._execute_directory_sweep(memory_manager)
+        result["write_count"] = 0
+        result["threshold"] = _SELF_CLEAN_THRESHOLD
+        return result
+
+    def _iter_archive_files(self) -> list[Path]:
+        """Return supported archive files under known domain folders only."""
+        files: list[Path] = []
+        for domain_root in self._categories.values():
+            if not domain_root.is_dir():
+                continue
+            for path in domain_root.rglob("*"):
+                if (
+                    path.is_file()
+                    and path.name not in _IGNORED_FILES
+                    and not path.name.startswith("._")
+                    and path.suffix.lower() in _SUPPORTED_EXTS
+                ):
+                    files.append(path)
+        return sorted(files)
+
+    def _infer_meta_from_archived_file(self, path: Path) -> dict[str, str] | None:
+        """Infer enough metadata from current path/name to reapply filing rules."""
+        try:
+            rel = path.relative_to(self._archive)
+        except ValueError:
+            return None
+        if len(rel.parts) < 2:
+            return None
+
+        folder_to_category = {folder: cat for cat, folder in CATEGORY_FOLDERS.items()}
+        category = folder_to_category.get(rel.parts[0])
+        if category is None:
+            return None
+
+        stem_parts = [part.strip() for part in path.stem.split("_") if part.strip()]
+        date = "Unknown"
+        document_type = "Unknown"
+        provider = ""
+
+        if stem_parts and re.match(r"^\d{4}-\d{2}-\d{2}$", stem_parts[0]):
+            date = stem_parts[0]
+            if len(stem_parts) >= 2:
+                document_type = stem_parts[1]
+            if len(stem_parts) >= 3:
+                provider = "_".join(stem_parts[2:])
+        elif stem_parts:
+            document_type = stem_parts[0]
+            if len(stem_parts) >= 2:
+                provider = "_".join(stem_parts[1:])
+
+        if len(rel.parts) >= 3 and rel.parts[1] == "Contracts":
+            provider = rel.parts[2] if rel.parts[2] != "Unknown_Counterparty" else provider
+            if document_type == "Unknown":
+                document_type = "Vertrag"
+        elif len(rel.parts) >= 2 and rel.parts[1] == "Gerichtsverfahren":
+            category = "Wohnen"
+            if document_type == "Unknown":
+                document_type = "Gerichtsverfahren"
+            if not any(marker in " ".join(stem_parts).lower() for marker in _HOUSING_LEGAL_MARKERS):
+                stem_parts.append("Gerichtsverfahren")
+        elif len(rel.parts) >= 2 and rel.parts[1] == "Lohnabrechnungen":
+            category = "Arbeit"
+            if document_type == "Unknown":
+                document_type = "Lohnabrechnung"
+
+        meta: dict[str, str] = {
+            "category": category,
+            "document_type": document_type,
+            "provider": provider,
+            "date": date,
+            "year": "Unknown",
+            "month": "Unknown",
+            "day": "Unknown",
+            "summary": "Inferred during lazy directory sweep",
+            "grouping_special": "",
+        }
+        self._enrich_ymd_from_date(meta)
+
+        if meta["date"] == "Unknown" and not _is_contract_document(meta):
+            # Preserve unknown-date date-based archives instead of guessing from mtime.
+            # Contracts are intentionally date-independent and can still be swept.
+            return None
+
+        return meta
+
+    def _expected_archive_path_for_sweep(self, path: Path, meta: dict[str, str]) -> Path | None:
+        cat_base = self._categories.get(meta.get("category", "Unknown"))
+        if cat_base is None:
+            return None
+        target_dir = self._derive_target_archive_dir(dict(meta), cat_base)
+        return target_dir / path.name
+
+    @staticmethod
+    def _unique_move_destination(dest: Path) -> Path:
+        if not dest.exists():
+            return dest
+        stamp = int(time.time())
+        candidate = dest.parent / f"{dest.stem}_{stamp}{dest.suffix}"
+        idx = 1
+        while candidate.exists():
+            candidate = dest.parent / f"{dest.stem}_{stamp}_{idx}{dest.suffix}"
+            idx += 1
+        return candidate
+
+    def _update_archive_vector_paths(
+        self,
+        memory_manager: Any | None,
+        *,
+        old_path: Path,
+        new_path: Path,
+    ) -> int:
+        """Best-effort Chroma metadata update for moved archive records."""
+        if memory_manager is None:
+            return 0
+        vectorstore = getattr(memory_manager, "_archive_vectorstore", None)
+        collection = getattr(vectorstore, "_collection", None)
+        if collection is None:
+            return 0
+
+        updated = 0
+        seen_ids: set[str] = set()
+        old_value = str(old_path)
+        new_value = str(new_path)
+
+        for key in ("absolute_path", "absolute_file_path"):
+            try:
+                payload = collection.get(where={key: old_value}, include=["metadatas"])
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Archive metadata lookup failed for %s=%s: %s", key, old_value, exc)
+                continue
+
+            ids = list(payload.get("ids") or [])
+            metadatas = list(payload.get("metadatas") or [])
+            for index, record_id in enumerate(ids):
+                if not record_id or record_id in seen_ids:
+                    continue
+                meta = dict(metadatas[index] or {}) if index < len(metadatas) else {}
+                meta["absolute_path"] = new_value
+                meta["absolute_file_path"] = new_value
+                meta["source_file"] = new_path.name
+                try:
+                    collection.update(ids=[record_id], metadatas=[meta])
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("Archive metadata update failed for %s: %s", record_id, exc)
+                    continue
+                seen_ids.add(record_id)
+                updated += 1
+
+        return updated
+
+    def _purge_empty_archive_dirs(self) -> int:
+        purged = 0
+        if not self._archive.is_dir():
+            return purged
+
+        domain_roots = {path.resolve() for path in self._categories.values()}
+        dirs = [path for path in self._archive.rglob("*") if path.is_dir()]
+        dirs.sort(key=lambda p: len(p.parts), reverse=True)
+        for current in dirs:
+            if current.resolve() in domain_roots or current.resolve() == self._archive.resolve():
+                continue
+            try:
+                next(current.iterdir())
+            except StopIteration:
+                pass
+            except OSError:
+                continue
+            else:
+                continue
+            try:
+                current.rmdir()
+            except OSError:
+                continue
+            purged += 1
+        return purged
+
+    def _execute_directory_sweep(self, memory_manager: Any | None) -> dict[str, Any]:
+        """Migrate misplaced archive files to current rules and purge empties."""
+        moved = 0
+        vector_updates = 0
+        moved_paths: list[dict[str, str]] = []
+
+        for path in self._iter_archive_files():
+            meta = self._infer_meta_from_archived_file(path)
+            if meta is None:
+                continue
+            expected = self._expected_archive_path_for_sweep(path, meta)
+            if expected is None:
+                continue
+            if path.resolve() == expected.resolve():
+                continue
+
+            dest = self._unique_move_destination(expected)
+            try:
+                self._safe_makedirs(dest.parent)
+                shutil.move(str(path), str(dest))
+            except OSError as exc:
+                logger.debug("Self-clean sweep could not move %s -> %s: %s", path, dest, exc)
+                continue
+
+            moved += 1
+            moved_paths.append({"old_path": str(path), "new_path": str(dest)})
+            vector_updates += self._update_archive_vector_paths(
+                memory_manager,
+                old_path=path,
+                new_path=dest,
+            )
+
+        purged = self._purge_empty_archive_dirs()
+        if moved or purged:
+            logger.info(
+                "Self-clean sweep complete: moved=%d vector_updates=%d purged_dirs=%d",
+                moved,
+                vector_updates,
+                purged,
+            )
+        return {
+            "moved": moved,
+            "vector_updates": vector_updates,
+            "purged": purged,
+            "moved_paths": moved_paths,
+        }
+
     def _derive_target_archive_dir(self, meta: dict[str, str], cat_base: Path) -> Path:
         """Date-default and smart-folder rules under ``Archiv/<Domain>/``.
 
@@ -903,6 +1315,9 @@ class HenryFileManager:
         arbeit_base = self._categories["Arbeit"]
         if _is_lohnabrechnung(meta):
             return arbeit_base / "Lohnabrechnungen" / year / month
+
+        if _is_housing_legal_dispute(meta):
+            return cat_base / "Gerichtsverfahren" / year / month / day
 
         if _is_contract_document(meta):
             return cat_base / "Contracts" / self._contract_entity_dirname(meta)
@@ -962,12 +1377,16 @@ class HenryFileManager:
         if treats_as_file:
             dest_file = anchor
         else:
-            os.makedirs(anchor, exist_ok=True)
+            self._safe_makedirs(anchor)
             fname = smart_name if smart_name else src.name
             dest_file = anchor / fname
 
-        os.makedirs(dest_file.parent, exist_ok=True)
-        return dest_file, None
+        try:
+            safe_dest = self._safe_archive_path(dest_file)
+        except ValueError as exc:
+            return None, str(exc)
+        self._safe_makedirs(safe_dest.parent)
+        return safe_dest, None
 
     def organize_file(
         self,
@@ -1015,7 +1434,7 @@ class HenryFileManager:
                 return None
 
             target_dir = self._derive_target_archive_dir(meta, cat_base)
-            os.makedirs(target_dir, exist_ok=True)
+            self._safe_makedirs(target_dir)
             dest = target_dir / (smart_name if smart_name else src.name)
 
         if dest.exists():
@@ -1246,6 +1665,36 @@ def create_worker_app(manager: HenryFileManager) -> FastAPI:
             "core_api_url": _CORE_API_URL,
         }
 
+    @app.post("/v1/document/classify")
+    def document_classify(body: DocumentClassifyRequest) -> dict[str, Any]:
+        if not body.raw_text.strip():
+            raise HTTPException(status_code=400, detail="raw_text is empty")
+        meta = classify_document(body.raw_text)
+        suffix = Path(body.filename).suffix or ".pdf"
+        proposed = HenryFileManager._build_smart_filename(meta, suffix) or body.filename
+        return {
+            "classification": meta,
+            "proposed_name": proposed,
+            "category": meta.get("category", "Unknown"),
+            "document_type": meta.get("document_type", "Unknown"),
+            "provider": meta.get("provider", "") or "",
+            "grouping_suggestion": meta.get("grouping_special") or "",
+        }
+
+    @app.post("/v1/document/correction/resolve")
+    def document_correction_resolve(body: DocumentCorrectionResolveRequest) -> dict[str, Any]:
+        document_id = body.document_id.strip()
+        correction_text = body.correction_text.strip()
+        if not document_id:
+            raise HTTPException(status_code=400, detail="document_id is required")
+        if not correction_text:
+            raise HTTPException(status_code=400, detail="correction_text is required")
+        return resolve_correction_to_archive_payload(document_id, correction_text)
+
+    @app.post("/v1/archive/maintenance/note_write")
+    def archive_maintenance_note_write() -> dict[str, Any]:
+        return manager.note_archive_write(None)
+
     @app.post("/v1/archive/execute")
     def archive_execute(cmd: ArchiveExecuteCommand) -> dict[str, Any]:
         try:
@@ -1264,6 +1713,7 @@ def _configure_logging() -> None:
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         stream=sys.stdout,
+        force=True,
     )
 
 
@@ -1283,6 +1733,7 @@ def _run_worker_service() -> None:
             host=_WORKER_API_HOST,
             port=_WORKER_API_PORT,
             log_level="info",
+            log_config=None,
         )
 
     api_thread = threading.Thread(target=_serve_api, name="henry-worker-api", daemon=True)

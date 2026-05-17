@@ -12,6 +12,12 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from core.health import (
+    OllamaEmbeddingAdapter,
+    chroma_persist_path,
+    chroma_settings,
+    disable_chroma_telemetry_env,
+)
 from langchain_core.documents import Document
 
 logger = logging.getLogger(__name__)
@@ -42,6 +48,61 @@ def _env_path(name: str, default: str = "") -> Path:
     return Path(raw).expanduser() if raw else Path()
 
 
+class NativeChromaVectorStore:
+    """Synchronous Chroma PersistentClient wrapper matching Henry's vector-store needs."""
+
+    def __init__(
+        self,
+        *,
+        collection_name: str,
+        persist_directory: Path,
+        embeddings: OllamaEmbeddingAdapter,
+    ) -> None:
+        disable_chroma_telemetry_env()
+        import chromadb
+
+        os.makedirs(persist_directory, exist_ok=True)
+        self._client = chromadb.PersistentClient(
+            path=str(persist_directory),
+            settings=chroma_settings(),
+        )
+        self._collection = self._client.get_or_create_collection(collection_name)
+        self._embeddings = embeddings
+
+    def add_documents(self, documents: list[Document], *, ids: list[str]) -> None:
+        texts = [doc.page_content for doc in documents]
+        metadatas = [doc.metadata for doc in documents]
+        embeddings = self._embeddings.embed_documents(texts)
+        self._collection.upsert(
+            ids=ids,
+            documents=texts,
+            metadatas=metadatas,
+            embeddings=embeddings,
+        )
+
+    def similarity_search(
+        self,
+        query: str,
+        *,
+        k: int = 4,
+        filter: dict[str, Any] | None = None,  # noqa: A002 - mirrors LangChain API
+    ) -> list[Document]:
+        query_embedding = self._embeddings.embed_query(query)
+        result = self._collection.query(
+            query_embeddings=[query_embedding],
+            n_results=k,
+            where=filter,
+            include=["documents", "metadatas"],
+        )
+        documents = (result.get("documents") or [[]])[0] or []
+        metadatas = (result.get("metadatas") or [[]])[0] or []
+        hits: list[Document] = []
+        for index, text in enumerate(documents):
+            metadata = metadatas[index] if index < len(metadatas) and isinstance(metadatas[index], dict) else {}
+            hits.append(Document(page_content=str(text or ""), metadata=metadata))
+        return hits
+
+
 class HenryMemoryManager:
     """
     Encrypted three-tier memory for Henry.
@@ -65,7 +126,7 @@ class HenryMemoryManager:
         ollama_base_url: str | None = None,
     ) -> None:
         self._mount = mount_path or _env_path("MEMORY_MOUNT_PATH")
-        self._archive_dir = archive_path or _env_path("ARCHIVE_DB_PATH")
+        self._archive_dir = archive_path or chroma_persist_path()
         self._personal_path = personal_db_path or _env_path("PERSONAL_MEMORY_PATH")
         self._embed_model = (embed_model or os.environ.get("HENRY_EMBED_MODEL", "nomic-embed-text")).strip()
         self._ollama_base = (
@@ -83,6 +144,7 @@ class HenryMemoryManager:
         self._chat_history_vectorstore: Any = None
         self._working_memory_vectorstore: Any = None
         self._sqlite_lock = threading.Lock()
+        self._chroma_init_thread: threading.Thread | None = None
 
         if not self.is_encrypted_storage_available:
             logger.warning(
@@ -101,7 +163,7 @@ class HenryMemoryManager:
             return
 
         self._init_personal_sqlite()
-        self._init_chroma_collections()
+        self._start_chroma_init()
 
     def _init_personal_sqlite(self) -> None:
         if not str(self._personal_path):
@@ -125,31 +187,38 @@ class HenryMemoryManager:
             self._conn = None
             self.personal_memory_ready = False
 
+    def _start_chroma_init(self) -> None:
+        self._chroma_init_thread = threading.Thread(
+            target=self._init_chroma_collections,
+            name="henry-chroma-init",
+            daemon=True,
+        )
+        self._chroma_init_thread.start()
+
     def _init_chroma_collections(self) -> None:
         if not str(self._archive_dir):
             return
         try:
-            from langchain_chroma import Chroma
-            from langchain_ollama import OllamaEmbeddings
+            os.makedirs(self._archive_dir, exist_ok=True)
 
-            embeddings = OllamaEmbeddings(
+            embeddings = OllamaEmbeddingAdapter(
                 model=self._embed_model,
                 base_url=self._ollama_base,
             )
-            self._archive_vectorstore = Chroma(
+            self._archive_vectorstore = NativeChromaVectorStore(
                 collection_name=_ARCHIVE_COLLECTION,
-                embedding_function=embeddings,
-                persist_directory=str(self._archive_dir),
+                persist_directory=self._archive_dir,
+                embeddings=embeddings,
             )
-            self._chat_history_vectorstore = Chroma(
+            self._chat_history_vectorstore = NativeChromaVectorStore(
                 collection_name=_CHAT_HISTORY_COLLECTION,
-                embedding_function=embeddings,
-                persist_directory=str(self._archive_dir),
+                persist_directory=self._archive_dir,
+                embeddings=embeddings,
             )
-            self._working_memory_vectorstore = Chroma(
+            self._working_memory_vectorstore = NativeChromaVectorStore(
                 collection_name=_WORKING_MEMORY_COLLECTION,
-                embedding_function=embeddings,
-                persist_directory=str(self._archive_dir),
+                persist_directory=self._archive_dir,
+                embeddings=embeddings,
             )
             self.archive_ready = True
             self.chat_history_ready = True
@@ -402,6 +471,52 @@ class HenryMemoryManager:
         document = Document(page_content=body, metadata=metadata)
         self._archive_vectorstore.add_documents([document], ids=[document_id])
         return document_id
+
+    def archive_update_file_path(
+        self,
+        *,
+        old_path: str | Path,
+        new_path: str | Path,
+    ) -> int:
+        """Update archive vector metadata when a document file moves on disk."""
+        if not self.archive_ready or self._archive_vectorstore is None:
+            return 0
+
+        collection = getattr(self._archive_vectorstore, "_collection", None)
+        if collection is None:
+            return 0
+
+        old_value = str(Path(old_path).expanduser())
+        new = Path(new_path).expanduser()
+        new_value = str(new)
+        updated = 0
+        seen_ids: set[str] = set()
+
+        for key in ("absolute_path", "absolute_file_path"):
+            try:
+                payload = collection.get(where={key: old_value}, include=["metadatas"])
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("archive_update_file_path lookup failed for %s=%s: %s", key, old_value, exc)
+                continue
+
+            ids = list(payload.get("ids") or [])
+            metadatas = list(payload.get("metadatas") or [])
+            for index, record_id in enumerate(ids):
+                if not record_id or record_id in seen_ids:
+                    continue
+                metadata = dict(metadatas[index] or {}) if index < len(metadatas) else {}
+                metadata["absolute_path"] = new_value
+                metadata["absolute_file_path"] = new_value
+                metadata["source_file"] = new.name
+                try:
+                    collection.update(ids=[record_id], metadatas=[metadata])
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("archive_update_file_path update failed for %s: %s", record_id, exc)
+                    continue
+                seen_ids.add(record_id)
+                updated += 1
+
+        return updated
 
     def archive_search(self, query: str, k: int = 4) -> list[Document]:
         """Return full LangChain Document hits, including metadata and file paths."""

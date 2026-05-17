@@ -7,13 +7,14 @@ from typing import Sequence
 
 import httpx
 
-from core.llm.base import ChatMessage
+from core.llm.base import ChatMessage, GenerationParameters
 
 
 class OpenAILLMProvider:
     def __init__(
         self,
         model: str,
+        generation_parameters: GenerationParameters,
         api_key: str | None = None,
         base_url: str | None = None,
         timeout_s: float = 120.0,
@@ -23,15 +24,20 @@ class OpenAILLMProvider:
             raise ValueError("OpenAI provider requires OPENAI_API_KEY")
         self._api_key = key
         self._model = model
+        self._generation_parameters = generation_parameters
         self._base = (base_url or os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1").rstrip(
             "/"
         )
         self._timeout = timeout_s
 
     def complete(self, messages: Sequence[ChatMessage]) -> str:
+        params = self._generation_parameters
         payload = {
             "model": self._model,
             "messages": [{"role": m.role, "content": m.content} for m in messages],
+            "temperature": params.temperature,
+            "top_p": params.top_p,
+            "max_tokens": params.num_ctx,
         }
         url = f"{self._base}/chat/completions"
         headers = {"Authorization": f"Bearer {self._api_key}"}
