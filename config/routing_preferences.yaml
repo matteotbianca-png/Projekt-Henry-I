@@ -1,0 +1,76 @@
+# Henry routing preferences
+# Edit the sliders below to steer routing without changing Python code.
+# Slider values must stay between 0.0 and 1.0.
+
+global_weights:
+  # Higher means Henry favors the most capable model for hard tasks.
+  skill_importance: 0.80
+  # Higher means Henry penalizes slow models more aggressively.
+  speed_priority: 0.45
+  # Higher means Henry avoids expensive cloud routes when local quality is enough.
+  cost_saving: 0.65
+  # Higher means Henry strongly prefers local/private routes.
+  privacy_priority: 0.90
+
+tier_overrides:
+  tier2_anonymized:
+    # If local models can reach this share of frontier capability, keep full execution local.
+    local_efficiency_threshold: 0.90
+    # If an abstract lookup can reach this confidence, keep private context local and use only a cloud micro-query.
+    lookup_efficiency_threshold: 0.90
+    # How much cloud usage is allowed after Presidio anonymization succeeds.
+    # 0.0 = avoid cloud, 1.0 = allow cloud when scoring says it is best.
+    cloud_allowance: 0.85
+
+  tier3_public:
+    # Public data still uses local models when they are close enough to frontier capability.
+    local_efficiency_threshold: 0.90
+
+model_parameters:
+  # Fallback for any explicitly configured model without a more specific block.
+  defaults:
+    temperature: 0.30
+    top_p: 0.90
+    num_ctx: 4096
+
+  qwen3:
+    aliases:
+      - qwen3
+      - qwen3:latest
+    temperature: 0.25
+    top_p: 0.90
+    num_ctx: 8192
+
+  qwen2_5:
+    aliases:
+      - qwen2.5
+      - qwen2.5:7b
+      - qwen2.5:latest
+    temperature: 0.25
+    top_p: 0.90
+    num_ctx: 8192
+
+  llama3_2:
+    aliases:
+      - llama3.2
+      - llama3.2:latest
+      - llama3.2:3b
+    temperature: 0.35
+    top_p: 0.92
+    num_ctx: 8192
+
+  gpt_4o:
+    aliases:
+      - gpt-4o
+    temperature: 0.30
+    top_p: 0.90
+    num_ctx: 4096
+
+  claude_3_5_sonnet:
+    aliases:
+      - claude-3-5-sonnet-20241022
+      - claude-3-5-sonnet
+      - claude-3.5-sonnet
+    temperature: 0.30
+    top_p: 0.90
+    num_ctx: 4096

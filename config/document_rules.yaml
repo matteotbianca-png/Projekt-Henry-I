@@ -1,0 +1,27 @@
+version: 1
+domains:
+  Wohnen: "01_Wohnen"
+  Finanzen: "02_Finanzen"
+  Versicherung: "03_Versicherung"
+  Arbeit: "04_Arbeit"
+  Gesundheit: "05_Gesundheit"
+  Mobilität: "06_Mobilität"
+  Korrespondenz: "07_Korrespondenz"
+special_routes:
+  housing_legal_disputes:
+    category: Wohnen
+    grouping_special: Gerichtsverfahren
+    target: "01_Wohnen/Gerichtsverfahren"
+    markers:
+      - gerichtsverfahren
+      - gericht
+      - court case
+      - legal dispute
+      - rechtsstreit
+      - klage
+      - schlichtungsbehörde
+      - mietgericht
+      - mietstreit
+      - mietrecht
+      - mieterschutz
+      - vermieterstreit

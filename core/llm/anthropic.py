@@ -7,13 +7,14 @@ from typing import Sequence
 
 import httpx
 
-from core.llm.base import ChatMessage
+from core.llm.base import ChatMessage, GenerationParameters
 
 
 class AnthropicLLMProvider:
     def __init__(
         self,
         model: str,
+        generation_parameters: GenerationParameters,
         api_key: str | None = None,
         base_url: str | None = None,
         timeout_s: float = 120.0,
@@ -23,12 +24,14 @@ class AnthropicLLMProvider:
             raise ValueError("Anthropic provider requires ANTHROPIC_API_KEY")
         self._api_key = key
         self._model = model
+        self._generation_parameters = generation_parameters
         self._base = (base_url or os.environ.get("ANTHROPIC_BASE_URL") or "https://api.anthropic.com").rstrip(
             "/"
         )
         self._timeout = timeout_s
 
     def complete(self, messages: Sequence[ChatMessage]) -> str:
+        params = self._generation_parameters
         system_parts: list[str] = []
         api_messages: list[dict[str, str]] = []
         for m in messages:
@@ -38,7 +41,9 @@ class AnthropicLLMProvider:
                 api_messages.append({"role": m.role, "content": m.content})
         payload: dict[str, object] = {
             "model": self._model,
-            "max_tokens": 4096,
+            "temperature": params.temperature,
+            "top_p": params.top_p,
+            "max_tokens": params.num_ctx,
             "messages": api_messages,
         }
         if system_parts:

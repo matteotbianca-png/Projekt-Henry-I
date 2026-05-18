@@ -8,7 +8,7 @@ from typing import Any, Mapping
 
 import yaml
 
-from core.llm.base import LLMProvider
+from core.llm.base import GenerationParameters, LLMProvider
 from core.llm.ollama import OllamaLLMProvider
 
 
@@ -22,6 +22,47 @@ def _load_yaml(path: Path) -> Mapping[str, Any]:
     if not isinstance(data, Mapping):
         raise ValueError(f"{path.name} must be a mapping at the root")
     return data
+
+
+def _as_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _generation_parameters_for_model(root: Path, model: str) -> GenerationParameters:
+    prefs_path = root / "config" / "routing_preferences.yaml"
+    prefs = _load_yaml(prefs_path)
+    params = prefs.get("model_parameters")
+    if not isinstance(params, Mapping):
+        raise ValueError("routing_preferences.yaml requires model_parameters")
+
+    selected = params.get("defaults")
+    model_key = model.strip().lower()
+    for label, block in params.items():
+        if not isinstance(block, Mapping):
+            continue
+        aliases = block.get("aliases") or []
+        alias_values = [str(alias).strip().lower() for alias in aliases] if isinstance(aliases, list) else []
+        if model_key == str(label).strip().lower() or model_key in alias_values:
+            selected = block
+            break
+
+    if not isinstance(selected, Mapping):
+        raise ValueError("model_parameters.defaults is required")
+    return GenerationParameters(
+        temperature=max(0.0, min(1.0, _as_float(selected.get("temperature"), 0.3))),
+        top_p=max(0.0, min(1.0, _as_float(selected.get("top_p"), 0.9))),
+        num_ctx=max(1, _as_int(selected.get("num_ctx"), 4096)),
+    )
 
 
 def build_llm_provider(config_path: Path | None = None) -> LLMProvider:
@@ -48,6 +89,10 @@ def build_llm_provider(config_path: Path | None = None) -> LLMProvider:
             base_url = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
         if not model:
             model = os.environ.get("OLLAMA_MODEL", "llama3.2")
-        return OllamaLLMProvider(base_url=base_url, model=model)
+        return OllamaLLMProvider(
+            base_url=base_url,
+            model=model,
+            generation_parameters=_generation_parameters_for_model(root, model),
+        )
 
     raise ValueError(f"Unsupported LLM provider: {provider!r}")
